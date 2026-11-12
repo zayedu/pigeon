@@ -17,7 +17,7 @@ def default_config() -> Path:
 
 
 class Exposure(BaseModel):
-    runtime: Literal["echo", "codex"]
+    runtime: Literal["echo", "codex", "claude"]
     workspace: Path | None = None
     executable: str = "codex"
     timeout: Annotated[int, Field(ge=1, le=900)] = 120
@@ -26,7 +26,7 @@ class Exposure(BaseModel):
     @model_validator(mode="after")
     def check_workspace(self):
         if (self.runtime == "codex") != (self.workspace is not None):
-            raise ValueError("Codex requires a workspace. Echo uses no workspace.")
+            raise ValueError("A workspace is required for Codex only.")
         return self
 
 

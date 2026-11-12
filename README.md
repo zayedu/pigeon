@@ -108,6 +108,34 @@ running turn, use `pigeon_status` with its conversation and request IDs.
 A GitHub PR reference supplies the owner, repository, and number as a hint.
 The runtime can use whatever relevant context is present in the approved checkout.
 
+### Let Codex initiate a conversation with Claude
+
+Claude Code can also receive requests in a dedicated text-only session. Use a
+current native Claude Code CLI with model access. On the Claude machine, use the
+Pigeon profile enrolled as the receiving identity (here, `@bob/claude`).
+
+```sh
+pigeon expose --agent claude
+# Run the dedicated Claude sign-in command printed by expose.
+pigeon allow @alice/codex
+pigeon daemon run
+```
+
+This runtime uses a dedicated Claude profile and has no workspace. Pigeon
+disables Claude's shell, file tools, and MCP tools for incoming turns. It rejects
+sessions that announce tools or MCP servers.
+
+On the Codex machine, register Pigeon with the active Codex CLI profile. Pass
+the absolute path to your Pigeon configuration if you use a custom profile.
+
+```sh
+codex mcp add pigeon -- "$(command -v pigeon)" mcp
+codex
+```
+
+Ask Codex to call Pigeon's `pigeon_ask` MCP tool with the Claude agent's address.
+Use `pigeon_reply` with the returned conversation ID for a follow-up.
+
 ### Real-provider smoke test
 
 On the receiver, add a file named `PIGEON_SMOKE.txt` containing a distinctive

@@ -279,3 +279,110 @@ class Codex:
         raise PigeonError(
             "codex_failed", "Codex could not complete the turn. Check its installation and login."
         )
+
+
+class Claude:
+    def __init__(self, state: Path, executable: str = "claude"):
+        binary = shutil.which(executable)
+        if not binary:
+            raise PigeonError("claude_missing", "Install the native Claude Code CLI.")
+        self.binary = str(Path(binary).resolve())
+        self.home = state.resolve() / "home"
+        self.cwd = state.resolve() / "run"
+        for directory in (self.home, self.cwd):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(Path.home()),
+            "CLAUDE_CONFIG_DIR": str(self.home),
+        }
+
+    async def check_login(self):
+        try:
+            async with (
+                asyncio.timeout(10),
+                subprocess(self.binary, "auth", "status", cwd=self.cwd, env=self.env) as process,
+            ):
+                stdout, _ = await process.communicate()
+                if process.returncode == 0 and json.loads(stdout).get("loggedIn") is True:
+                    return
+        except (OSError, ValueError, TimeoutError):
+            pass
+        raise PigeonError("claude_login", "Sign in using the command printed by pigeon expose.")
+
+    async def run(self, turn: Turn, session: str | None) -> tuple[str, str]:
+        try:
+            session_id = str(UUID(session)) if session else str(uuid4())
+        except ValueError:
+            raise PigeonError("claude_resume", "Stored Claude session ID is invalid.") from None
+        prompt = json.dumps(
+            {"peer": turn.request.sender, "message": turn.request.content}, ensure_ascii=False
+        )
+        settings = json.dumps(
+            {
+                "disableAllHooks": True,
+                "disableClaudeAiConnectors": True,
+                "permissions": {"deny": ["*"]},
+            }
+        )
+        args = [
+            "--print",
+            "--safe-mode",
+            "--restricted",
+            "--disable-slash-commands",
+            "--tools",
+            "",
+            "--disallowedTools",
+            "*",
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
+            "--permission-mode",
+            "dontAsk",
+            "--settings",
+            settings,
+            "--system-prompt",
+            "You are a text-only Pigeon peer. Answer the peer's message using this conversation.",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--resume" if session else "--session-id",
+            session_id,
+        ]
+        initialized = False
+        answer = ""
+        try:
+            async with subprocess(self.binary, *args, cwd=self.cwd, env=self.env) as process:
+                process.stdin.write(prompt.encode())
+                await process.stdin.drain()
+                process.stdin.close()
+                async for line in process.stdout:
+                    event = json.loads(line)
+                    match event:
+                        case {"type": "system", "subtype": "init"}:
+                            if event.get("tools") != [] or event.get("mcp_servers") != []:
+                                raise PigeonError(
+                                    "claude_tools",
+                                    "Claude started with tools enabled. Turn stopped.",
+                                )
+                            initialized = event.get("session_id") == session_id
+                        case {
+                            "type": "result",
+                            "subtype": "success",
+                            "is_error": False,
+                            "session_id": str(result_session),
+                            "result": str(text),
+                        } if result_session == session_id:
+                            answer = text[:MAX_TEXT]
+                await process.wait()
+                if process.returncode == 0 and initialized and answer.strip():
+                    return session_id, answer
+        except (ValueError, OSError):
+            pass
+        if session:
+            raise PigeonError(
+                "claude_resume", "Claude could not resume the turn. Start a new conversation."
+            )
+        raise PigeonError(
+            "claude_failed", "Claude could not complete the turn. Check its version and login."
+        )

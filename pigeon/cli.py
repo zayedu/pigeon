@@ -15,7 +15,7 @@ from uuid import UUID
 import typer
 from pydantic import ValidationError
 
-from .adapters import Codex
+from .adapters import Claude, Codex
 from .client import ask_agent, open_client, relay_endpoint
 from .config import (
     Config,
@@ -125,37 +125,47 @@ def login(
 @app.command()
 def expose(
     ctx: typer.Context,
-    agent: Annotated[Literal["codex", "echo"], typer.Option("--agent")],
+    agent: Annotated[Literal["codex", "claude", "echo"], typer.Option("--agent")],
     repo: Path | None = None,
     timeout: Annotated[int, typer.Option(min=1, max=900)] = 120,
     concurrency: Annotated[int, typer.Option(min=1, max=4)] = 1,
     codex: str = "codex",
+    claude: str = "claude",
 ):
     """Configure the runtime for this identity."""
     if (agent == "codex") != (repo is not None):
-        raise PigeonError("invalid_workspace", "Supply --repo for Codex. Echo uses no workspace.")
+        raise PigeonError("invalid_workspace", "Supply --repo for Codex only.")
     workspace = repo.resolve() if repo else None
+    state = state_path(ctx.obj)
+    runtime = None
     with config_lock(ctx.obj):
         config = load(ctx.obj)
         if daemon_running(ctx.obj):
             raise PigeonError("daemon_running", "Stop the daemon before changing its runtime.")
         if workspace:
-            runtime = Codex(workspace, state_path(ctx.obj) / "codex", codex)
-            codex = runtime.binary
+            runtime = Codex(workspace, state / "codex", codex)
+        elif agent == "claude":
+            runtime = Claude(state / "claude", claude)
         config.exposure = Exposure(
             runtime=agent,
             workspace=workspace,
-            executable=codex,
+            executable=runtime.binary if runtime else "echo",
             timeout=timeout,
             concurrency=concurrency,
         )
         save(ctx.obj, config)
     typer.echo(f"Configured {config.agent} to use {agent}.")
-    if workspace:
+    if isinstance(runtime, Codex):
         typer.echo("Sign in to the dedicated Codex home if needed.")
         typer.echo(
             f"CODEX_HOME={shlex.quote(str(runtime.home))} "
             + shlex.join([runtime.binary, "-c", 'cli_auth_credentials_store="file"', "login"])
+        )
+    elif isinstance(runtime, Claude):
+        typer.echo("Sign in to the dedicated Claude profile if needed.")
+        typer.echo(
+            f"CLAUDE_CONFIG_DIR={shlex.quote(str(runtime.home))} "
+            + shlex.join([runtime.binary, "auth", "login"])
         )
     typer.echo("Run pigeon allow for each peer, then pigeon daemon run.")
 
@@ -203,11 +213,12 @@ def run_daemon(ctx: typer.Context):
         raise PigeonError("not_exposed", "Run pigeon expose to configure a runtime.")
     state = state_path(ctx.obj)
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
-    runtime = (
-        Codex(exposure.workspace, state / "codex", exposure.executable)
-        if exposure.workspace
-        else Echo()
-    )
+    if exposure.workspace:
+        runtime = Codex(exposure.workspace, state / "codex", exposure.executable)
+    elif exposure.runtime == "claude":
+        runtime = Claude(state / "claude", exposure.executable)
+    else:
+        runtime = Echo()
     session_scope = hashlib.sha256(
         f"{exposure.runtime}\0{exposure.workspace}".encode()
     ).hexdigest()[:16]
@@ -220,6 +231,7 @@ def run_daemon(ctx: typer.Context):
         with suppress(asyncio.CancelledError):
             if isinstance(runtime, Codex):
                 await runtime.check_sandbox()
+            if isinstance(runtime, (Claude, Codex)):
                 await runtime.check_login()
             await Daemon(
                 config.relay,
@@ -339,6 +351,10 @@ def doctor(ctx: typer.Context):
         typer.echo(f"Codex sandbox checks passed for {runtime.workspace}.")
         asyncio.run(runtime.check_login())
         typer.echo("Dedicated Codex home is signed in.")
+    elif exposure and exposure.runtime == "claude":
+        runtime = Claude(state_path(ctx.obj) / "claude", exposure.executable)
+        asyncio.run(runtime.check_login())
+        typer.echo("Dedicated Claude profile is signed in.")
     elif exposure is None:
         typer.echo("No inbound runtime configured.")
 
