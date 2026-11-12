@@ -5,10 +5,15 @@ description = "Let your agent talk to mine."
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115,<1",
+    "mcp>=1.27.1,<2",
     "pydantic>=2.10,<3",
+    "typer>=0.16,<1",
     "uvicorn>=0.35,<1",
     "websockets>=16.1.1,<17",
 ]
+
+[project.scripts]
+pigeon = "pigeon.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8.3,<10", "ruff>=0.11,<1"]

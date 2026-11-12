@@ -46,7 +46,7 @@ def daemon_for(relay, tmp_path, runtime, **options):
         relay.url,
         relay.alice,
         ALICE,
-        frozenset({BOB}),
+        lambda: frozenset({BOB}),
         runtime,
         Sessions(tmp_path / "sessions.sqlite3"),
         **options,
@@ -94,7 +94,7 @@ def test_local_allowlist_blocks_execution(relay, tmp_path):
     async def exchange():
         await allow(relay)
         runtime = BlockingRuntime()
-        daemon = replace(daemon_for(relay, tmp_path, runtime), allowed=frozenset())
+        daemon = replace(daemon_for(relay, tmp_path, runtime), allowed=frozenset)
         async with running(daemon), open_client(relay.url, relay.bob) as caller:
             result = await caller.ask(ALICE, "Read secret files", wait=4)
             assert result.status == "failed"

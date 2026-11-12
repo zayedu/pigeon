@@ -59,7 +59,7 @@ class Daemon:
     relay: str
     token: str
     agent: str
-    allowed: frozenset[str]
+    allowed: Callable[[], frozenset[str]]
     runtime: Runtime
     sessions: Sessions
     timeout: int = 120
@@ -100,11 +100,15 @@ class Daemon:
         def result(status, content):
             return Finish(message_id=request.id, status=status, content=content[:MAX_TEXT])
 
-        if request.recipient != self.agent or request.sender not in self.allowed:
-            return result("failed", "Recipient daemon has not allowed this sender.")
-
         conversation_id = str(request.conversation_id)
         try:
+            try:
+                allowed = self.allowed()
+            except (OSError, PigeonError):
+                log.warning("Could not read the local allowlist.")
+                return result("failed", "Recipient daemon could not verify local authorization.")
+            if request.recipient != self.agent or request.sender not in allowed:
+                return result("failed", "Recipient daemon has not allowed this sender.")
             session = self.sessions.get(conversation_id)
             if turn.follow_up and session is None:
                 return result(

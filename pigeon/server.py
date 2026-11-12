@@ -121,12 +121,16 @@ def create_app(path: Path) -> FastAPI:
             await socket.close(code=1008)
             return
         connections[agent] += 1
+        receive = None
+        operation = None
         try:
             await socket.accept()
+            receive = asyncio.create_task(socket.receive())
             while True:
-                incoming = await socket.receive()
+                incoming = await receive
                 if incoming["type"] == "websocket.disconnect":
                     break
+                receive = asyncio.create_task(socket.receive())
                 raw = incoming.get("text")
                 if raw is None or len(raw.encode()) > MAX_FRAME:
                     await socket.close(code=1009)
@@ -136,7 +140,11 @@ def create_app(path: Path) -> FastAPI:
                         raise PigeonError("unauthenticated", "Credential is no longer valid.")
                     rate_limit(agent)
                     frame = command.validate_json(raw)
-                    response = {"ok": await dispatch(agent, digest, frame)}
+                    operation = asyncio.create_task(dispatch(agent, digest, frame))
+                    await asyncio.wait((operation, receive), return_when=asyncio.FIRST_COMPLETED)
+                    if receive.done() and receive.result()["type"] == "websocket.disconnect":
+                        break
+                    response = {"ok": await operation}
                 except ValidationError:
                     response = {"error": "invalid_frame", "message": "Invalid protocol frame."}
                 except PigeonError as exc:
@@ -150,6 +158,10 @@ def create_app(path: Path) -> FastAPI:
         except WebSocketDisconnect:
             pass
         finally:
+            pending = [task for task in (receive, operation) if task is not None]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
             connections[agent] -= 1
             if not connections[agent]:
                 del connections[agent]

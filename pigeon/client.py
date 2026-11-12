@@ -33,7 +33,7 @@ def relay_endpoint(relay: str) -> str:
         url = urlsplit(relay)
         if (
             url.hostname
-            and not url.username
+            and url.username is None
             and url.password is None
             and url.path in ("", "/")
             and not url.query
@@ -78,9 +78,15 @@ class Client:
         self.lock = asyncio.Lock()
 
     async def call(self, request: Command):
-        async with self.lock, asyncio.timeout(MAX_WAIT + 5):
-            await self.socket.send(request.model_dump_json())
-            response = json.loads(await self.socket.recv())
+        async with self.lock:
+            try:
+                async with asyncio.timeout(MAX_WAIT + 5):
+                    await self.socket.send(request.model_dump_json())
+                    response = json.loads(await self.socket.recv())
+            except (TimeoutError, asyncio.CancelledError):
+                # A late reply could otherwise be mistaken for the next operation's reply.
+                await self.socket.close()
+                raise
         if "error" in response:
             raise PigeonError(response["error"], response["message"])
         return response["ok"]
@@ -121,3 +127,48 @@ class Client:
                 )
             )
         return turn
+
+
+async def ask_agent(
+    relay: str,
+    token: str,
+    message: str,
+    *,
+    to: str | None = None,
+    context: Context | None = None,
+    conversation_id: UUID | None = None,
+    wait: int = 15,
+) -> Turn:
+    conversation_id = conversation_id or uuid4()
+    message_id = uuid4()
+    loop = asyncio.get_running_loop()
+    until = loop.time() + wait
+    submitted = False
+    for attempt in range(3):
+        try:
+            async with open_client(relay, token) as client:
+                if to is None:
+                    previous = await client.turn(Inspect(conversation_id=conversation_id))
+                    to = previous.request.recipient
+                submitted = True
+                return await client.ask(
+                    to,
+                    message,
+                    context=context,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    wait=max(0, int(until - loop.time())),
+                )
+        except PigeonError as exc:
+            if exc.code not in ("connection", "storage_unavailable"):
+                raise
+            if attempt == 2:
+                if submitted:
+                    raise PigeonError(
+                        exc.code,
+                        f"{exc} Check status for conversation {conversation_id}, "
+                        f"message {message_id}, before resending.",
+                    ) from None
+                raise
+            await asyncio.sleep(0.25 * 2**attempt)
+    raise AssertionError("Retry loop exhausted.")

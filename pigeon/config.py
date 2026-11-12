@@ -1,0 +1,104 @@
+import os
+import re
+import tempfile
+from collections.abc import Callable
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, Field, ValidationError, model_validator
+
+from .models import Address, PigeonError
+
+
+def default_config() -> Path:
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return base / "pigeon" / "config.json"
+
+
+class Exposure(BaseModel):
+    runtime: Literal["echo", "codex"]
+    workspace: Path | None = None
+    executable: str = "codex"
+    timeout: Annotated[int, Field(ge=1, le=900)] = 120
+    concurrency: Annotated[int, Field(ge=1, le=4)] = 1
+
+    @model_validator(mode="after")
+    def check_workspace(self):
+        if (self.runtime == "codex") != (self.workspace is not None):
+            raise ValueError("Codex requires a workspace. Echo uses no workspace.")
+        return self
+
+
+class Config(BaseModel):
+    relay: str
+    token: Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{43}$", repr=False)]
+    agent: Address
+    allowed: frozenset[Address] = frozenset()
+    exposure: Exposure | None = None
+
+
+def load(path: Path) -> Config:
+    try:
+        with path.open() as handle:
+            if os.fstat(handle.fileno()).st_mode & 0o077:
+                raise PigeonError("config_permissions", f"Run chmod 600 on {path}.")
+            return Config.model_validate_json(handle.read())
+    except FileNotFoundError:
+        raise PigeonError("not_configured", f"Run pigeon login to create {path}.") from None
+    except ValidationError:
+        raise PigeonError("invalid_config", f"Invalid Pigeon configuration at {path}.") from None
+
+
+def save(path: Path, config: Config):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            handle.write(config.model_dump_json(indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def validate_token(token: str):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+        raise PigeonError("invalid_token", "Paste the token issued by pigeon relay enroll.")
+
+
+def state_path(path: Path) -> Path:
+    return path.with_name(path.name + ".state")
+
+
+@contextmanager
+def config_lock(path: Path):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with local_lock(path.with_name(path.name + ".lock")):
+        yield
+
+
+@contextmanager
+def local_lock(path: Path, *, check_only: bool = False):
+    import fcntl
+
+    with path.open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if check_only:
+                yield True
+                return
+            raise PigeonError("locked", f"Another Pigeon process is using {path.name}.") from None
+        yield False
+
+
+def local_allowlist(path: Path, initial: Config) -> Callable[[], frozenset[str]]:
+    def allowed():
+        config = load(path)
+        if (config.agent, config.relay) != (initial.agent, initial.relay):
+            return frozenset()
+        return config.allowed
+
+    return allowed

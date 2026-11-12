@@ -39,11 +39,13 @@ async def subprocess(*args, cwd: Path, env: dict[str, str]):
     try:
         yield process
     finally:
-        if process.returncode is None:
+        if process.returncode is None or not process.stdout.at_eof():
             with suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
-        # Drain stdout after interruption so pipe backpressure cannot block process.wait().
-        await process.communicate()
+        # A terminated child may have inherited stdout. Bound the drain as well.
+        with suppress(TimeoutError):
+            async with asyncio.timeout(2):
+                await process.communicate()
 
 
 class Codex:
@@ -109,16 +111,21 @@ class Codex:
 
     async def check_sandbox(self):
         write_probe = self.workspace / f".pigeon-probe-{uuid4().hex}"
-        with tempfile.NamedTemporaryFile(dir=self.state) as private, socket.socket() as listener:
+        with (
+            tempfile.NamedTemporaryFile(dir=self.state) as private,
+            tempfile.NamedTemporaryFile(dir=self.state.parent) as outside,
+            socket.socket() as listener,
+        ):
             listener.bind(("127.0.0.1", 0))
             listener.listen(1)
             port = listener.getsockname()[1]
             probe = """
                 /bin/ls "$1" >/dev/null || exit 1
                 if /bin/cat "$2" >/dev/null 2>&1; then exit 2; fi
-                if (set -C; : > "$3") 2>/dev/null; then exit 3; fi
-                curl --version >/dev/null || exit 4
-                curl -s --noproxy '*' --max-time 1 "$4" >/dev/null 2>&1
+                if /bin/cat "$3" >/dev/null 2>&1; then exit 3; fi
+                if (set -C; : > "$4") 2>/dev/null; then exit 4; fi
+                curl --version >/dev/null || exit 5
+                curl -s --noproxy '*' --max-time 1 "$5" >/dev/null 2>&1
                 exit 0
             """
             try:
@@ -138,6 +145,7 @@ class Codex:
                         "pigeon-sandbox-check",
                         str(self.workspace),
                         private.name,
+                        outside.name,
                         str(write_probe),
                         f"http://127.0.0.1:{port}",
                         cwd=self.cwd,
@@ -155,6 +163,27 @@ class Codex:
             "sandbox_failed",
             "Codex sandbox check failed. Check Codex CLI, curl, and OS sandbox support.",
         )
+
+    async def check_login(self):
+        try:
+            async with (
+                asyncio.timeout(8),
+                subprocess(
+                    self.binary,
+                    "-c",
+                    'cli_auth_credentials_store="file"',
+                    "login",
+                    "status",
+                    cwd=self.cwd,
+                    env=self.env,
+                ) as process,
+            ):
+                await process.communicate()
+                if process.returncode == 0:
+                    return
+        except (OSError, TimeoutError):
+            pass
+        raise PigeonError("codex_login", "Sign in using the command printed by pigeon expose.")
 
     async def run(self, turn: Turn, session: str | None) -> tuple[str, str]:
         if session:
@@ -197,6 +226,8 @@ class Codex:
                 async for line in process.stdout:
                     event = json.loads(line)
                     match event:
+                        case {"type": "item.completed", "item": {"type": "error"}}:
+                            break
                         case {"type": "thread.started", "thread_id": str(value)}:
                             thread_id = str(UUID(value))
                         case {"type": "turn.completed"}:
@@ -206,7 +237,8 @@ class Codex:
                             "item": {"type": "agent_message", "text": str(value)},
                         }:
                             answer = value[:MAX_TEXT]
-                await process.wait()
+                else:
+                    await process.wait()
                 if (
                     process.returncode == 0
                     and completed
