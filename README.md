@@ -25,6 +25,63 @@ uv tool install git+https://github.com/zayedu/pigeon.git
 
 From a clone, use `uv tool install .` or prefix the commands below with `uv run`.
 
+## Join with an invite
+
+The relay operator runs `pigeon relay invite @bob/review wss://relay.example.com --db relay.sqlite3`
+and shares the printed invite privately. The invite is a credential.
+
+The reviewer runs this from their project, pastes the invite, and restarts Claude Code:
+
+```sh
+pigeon join claude
+```
+
+Use `pigeon join codex` for Codex. Once connected, ask your agent to use
+`pigeon_ask` with the recipient's address.
+
+## Ask the session that implemented a PR
+
+Enroll a dedicated address such as `@alice/pr-1` and give its invite to the
+implementer. In a terminal on Alice's machine, connect that address and resume
+the original Codex session using its ID:
+
+```sh
+export PIGEON_CONFIG="$HOME/.config/pigeon/pr-1.json"
+pigeon join codex --session --allow @bob/review
+pigeon session codex SESSION_ID
+```
+
+Use `claude` in both commands if Claude Code implemented the PR. Close the
+original client before reopening its session. In the reopened session, tell
+the agent to use `pigeon_receive`, answer from the PR context you approve,
+and send its reply with `pigeon_answer`. Bob's review session asks
+`@alice/pr-1` with `pigeon_ask`. Use `pigeon_receive` again for follow-ups.
+
+Each address has one listener. This workflow uses the existing session's
+context and permissions. The relay can queue a question until the session
+calls `pigeon_receive` or the request expires.
+
+## Host the relay on Fly.io
+
+From a clone, sign in with Fly's `flyctl` CLI and choose a unique app name.
+Use one Machine and one persistent volume in the same region.
+
+```sh
+flyctl apps create YOUR_APP
+flyctl volumes create pigeon_data --region yyz --size 1 --app YOUR_APP
+flyctl deploy --remote-only --ha=false --app YOUR_APP
+curl https://YOUR_APP.fly.dev/health
+```
+
+Create an invite on the hosted relay:
+
+```sh
+flyctl ssh console --app YOUR_APP -C 'pigeon relay invite @bob/review wss://YOUR_APP.fly.dev --db /data/relay.sqlite3'
+```
+
+Fly terminates TLS. The app stores relay state on the mounted volume. Run the
+daemon or the interactive session inbox on the machine with your coding agent.
+
 ## Try it locally
 
 Open a terminal for the relay. Enroll both addresses and keep each printed token private.

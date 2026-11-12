@@ -169,8 +169,16 @@ def create_app(path: Path) -> FastAPI:
     return app
 
 
-def serve(path: Path, host: str, port: int, cert: Path | None = None, key: Path | None = None):
-    if bool(cert) != bool(key) or (not cert and not is_loopback(host)):
+def serve(
+    path: Path,
+    host: str,
+    port: int,
+    cert: Path | None = None,
+    key: Path | None = None,
+    *,
+    behind_tls_proxy: bool = False,
+):
+    if bool(cert) != bool(key) or (not cert and not behind_tls_proxy and not is_loopback(host)):
         raise PigeonError("tls_required", "Supply a TLS certificate and key for a public bind.")
     uvicorn.run(
         create_app(path),

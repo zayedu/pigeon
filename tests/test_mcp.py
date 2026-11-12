@@ -9,7 +9,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from pigeon.client import open_client
-from pigeon.models import Submit, Turn
+from pigeon.models import Inspect, Submit, Turn
 
 
 def cli(config, *args):
@@ -96,3 +96,49 @@ def test_cli_daemon_and_stdio_mcp(relay, tmp_path):
         if daemon.poll() is None:
             daemon.kill()
             daemon.wait()
+
+
+def test_invite_and_session_reply(relay, tmp_path):
+    receiver = tmp_path / "review.json"
+    invite = run_cli(
+        receiver, "relay", "invite", "@alice/pr-42", relay.url, "--db", str(relay.store.path)
+    ).stdout.strip()
+    run_cli(receiver, "join", "claude", "--session", "--allow", BOB, token=invite + "\n")
+    assert S_IMODE(receiver.stat().st_mode) == 0o600
+
+    async def exchange():
+        executable, *args = cli(receiver, "mcp", "--session")
+        async with (
+            asyncio.timeout(10),
+            stdio_client(StdioServerParameters(command=executable, args=args)) as (read, write),
+            ClientSession(read, write) as mcp,
+            open_client(relay.url, relay.bob) as caller,
+        ):
+            await mcp.initialize()
+            request = Submit(
+                to="@alice/pr-42",
+                message="Why did you remove the cache?",
+                conversation_id=uuid4(),
+                message_id=uuid4(),
+            )
+            await caller.turn(request)
+            received = await mcp.call_tool("pigeon_receive", {})
+            assert not received.isError
+            turn = Turn.model_validate(received.structuredContent["result"])
+            assert turn.request.content == request.message
+
+            unrelated = await mcp.call_tool(
+                "pigeon_answer", {"message_id": str(uuid4()), "message": "Wrong request"}
+            )
+            assert unrelated.isError
+
+            answer = "The cache outlived the session."
+            replied = await mcp.call_tool(
+                "pigeon_answer", {"message_id": str(request.message_id), "message": answer}
+            )
+            assert not replied.isError
+            completed = await caller.turn(Inspect(conversation_id=request.conversation_id))
+            assert completed.status == "completed"
+            assert completed.response.content == answer
+
+    asyncio.run(exchange())
