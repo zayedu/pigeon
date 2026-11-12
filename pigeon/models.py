@@ -1,6 +1,6 @@
 from typing import Annotated, Literal
 
-from pydantic import UUID4, BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import UUID4, BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
 MAX_FRAME = 64 * 1024
 MAX_TEXT = 4_000
@@ -20,9 +20,16 @@ class Context(Frame):
     type: Literal["github_pr"]
     repo: Annotated[
         str,
-        Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_-][A-Za-z0-9_.-]{0,99}$"),
+        Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$"),
     ]
     number: Annotated[int, Field(strict=True, ge=1, le=2**31 - 1)]
+
+    @field_validator("repo")
+    @classmethod
+    def validate_repo(cls, value: str) -> str:
+        if value.partition("/")[2] in {".", ".."}:
+            raise ValueError("Use a GitHub owner and repository name.")
+        return value
 
 
 class Submit(Frame):

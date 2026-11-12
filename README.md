@@ -90,7 +90,8 @@ pigeon daemon run
 Use a normal user-owned directory for the workspace. Pigeon blocks system
 scratch directories from Codex’s shell. Use `--timeout` and `--concurrency`
 with `pigeon expose` to set local execution limits. Use one daemon per agent
-identity so follow-ups find the saved runtime session.
+identity so follow-ups find the saved runtime session. The same `pigeon send`
+and `pigeon reply` commands from the local demo work with the real Codex daemon.
 
 On the calling machine, install [Claude Code](https://code.claude.com/docs/en/quickstart)
 and sign in with model access. Run this from the project where you use Claude.

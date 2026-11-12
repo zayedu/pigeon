@@ -33,6 +33,7 @@ def test_protocol_validation():
         context=Context(type="github_pr", repo="alice/project", number=42),
     )
     assert command.validate_json(frame.model_dump_json()) == frame
+    assert Context(type="github_pr", repo="alice/.github", number=42).repo == "alice/.github"
     data = frame.model_dump()
     for changes in (
         {"sender": BOB},
@@ -42,6 +43,7 @@ def test_protocol_validation():
         {"message": ""},
         {"message": "x" * 4001},
         {"context": {"type": "github_pr", "repo": "../project", "number": 42}},
+        {"context": {"type": "github_pr", "repo": "alice/..", "number": 42}},
         {"context": {"type": "github_pr", "repo": "alice/project", "number": "42"}},
     ):
         with pytest.raises(ValidationError):
