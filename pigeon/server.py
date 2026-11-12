@@ -10,7 +10,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
 from .client import is_loopback
-from .db import Store, token_hash
+from .db import open_store, token_hash
 from .models import (
     ACTIVE,
     MAX_FRAME,
@@ -28,8 +28,9 @@ from .models import (
 )
 
 
-def create_app(path: Path) -> FastAPI:
-    store = Store(path)
+def create_app(path: Path | None) -> FastAPI:
+    store = open_store(path)
+    shared = path is None
     changed = asyncio.Event()
     connections: Counter[str] = Counter()
     buckets: dict[str, tuple[float, float]] = {}
@@ -51,6 +52,9 @@ def create_app(path: Path) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app):
+        if shared:
+            yield
+            return
         task = asyncio.create_task(sweep())
         try:
             yield
@@ -73,37 +77,50 @@ def create_app(path: Path) -> FastAPI:
             raise PigeonError("rate_limited", "Slow down and try again.")
         buckets[agent] = (balance - 1, now)
 
+    async def storage(operation, *args):
+        if shared:
+            return await asyncio.to_thread(operation, *args)
+        return operation(*args)
+
     async def dispatch(agent: str, digest: str, frame: Command):
         if isinstance(frame, (Inspect, Take)):
             until = monotonic() + frame.wait
             while True:
-                if store.authenticate(digest) != agent:
+                if await storage(store.authenticate, digest) != agent:
                     raise PigeonError("unauthenticated", "Credential is no longer valid.")
                 event = changed
                 if isinstance(frame, Inspect):
-                    result = store.inspect(agent, frame)
+                    if shared:
+                        await storage(store.expire)
+                    result = await storage(store.inspect, agent, frame)
                     if result["status"] != frame.after or result["status"] not in ACTIVE:
                         return result
                 else:
-                    result = store.take(agent)
+                    result = await storage(store.take, agent)
                     if result:
                         notify()
                         return result
-                try:
-                    await asyncio.wait_for(event.wait(), max(0, until - monotonic()))
-                except TimeoutError:
+                remaining = until - monotonic()
+                if remaining <= 0:
                     return result
+                try:
+                    await asyncio.wait_for(event.wait(), min(1, remaining) if shared else remaining)
+                except TimeoutError:
+                    if monotonic() >= until:
+                        return result
         match frame:
             case Submit():
-                result = store.submit(agent, frame)
+                result = await storage(store.submit, agent, frame)
             case Cancel():
-                result = store.inspect(agent, frame)
+                result = await storage(store.inspect, agent, frame)
             case Finish():
-                result = store.finish(agent, frame)
+                result = await storage(store.finish, agent, frame)
             case Grant():
-                result = store.grant(agent, frame.sender, frame.op == "allow")
+                result = await storage(store.grant, agent, frame.sender, frame.op == "allow")
             case ListCalls():
-                return store.list_calls(agent)
+                if shared:
+                    await storage(store.expire)
+                return await storage(store.list_calls, agent)
             case Ping():
                 return {"agent": agent, "protocol": 1}
         notify()
@@ -116,7 +133,7 @@ def create_app(path: Path) -> FastAPI:
             await socket.close(code=1008)
             return
         digest = token_hash(credential)
-        agent = store.authenticate(digest)
+        agent = await storage(store.authenticate, digest)
         if agent is None or connections[agent] >= 16:
             await socket.close(code=1008)
             return
@@ -136,7 +153,7 @@ def create_app(path: Path) -> FastAPI:
                     await socket.close(code=1009)
                     break
                 try:
-                    if store.authenticate(digest) != agent:
+                    if await storage(store.authenticate, digest) != agent:
                         raise PigeonError("unauthenticated", "Credential is no longer valid.")
                     rate_limit(agent)
                     frame = command.validate_json(raw)

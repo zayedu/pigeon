@@ -42,17 +42,14 @@ Use `pigeon join codex` for Codex. Once connected, ask your agent to use
 ## Ask the session that implemented a PR
 
 Enroll a dedicated address such as `@alice/pr-1` and give its invite to the
-implementer. In a terminal on Alice's machine, connect that address and resume
-the original Codex session using its ID:
+implementer. Alice closes the implementing session, then runs:
 
 ```sh
-export PIGEON_CONFIG="$HOME/.config/pigeon/pr-1.json"
-pigeon join codex --session --allow @bob/review
-pigeon session codex SESSION_ID
+pigeon join codex --session
 ```
 
-Use `claude` in both commands if Claude Code implemented the PR. Close the
-original client before reopening its session. In the reopened session, tell
+Paste the invite, enter the reviewer's address, and pick the original session.
+Use `claude` if Claude Code implemented the PR. In the reopened session, tell
 the agent to use `pigeon_receive`, answer from the PR context you approve,
 and send its reply with `pigeon_answer`. Bob's review session asks
 `@alice/pr-1` with `pigeon_ask`. Use `pigeon_receive` again for follow-ups.
@@ -60,6 +57,24 @@ and send its reply with `pigeon_answer`. Bob's review session asks
 Each address has one listener. This workflow uses the existing session's
 context and permissions. The relay can queue a question until the session
 calls `pigeon_receive` or the request expires.
+
+## Host the relay on Vercel
+
+Deploy this repository as a FastAPI project. Connect a Turso database to the
+deployment environment so Vercel provides `TURSO_DATABASE_URL` and
+`TURSO_AUTH_TOKEN`. Pigeon creates the schema on first use. All relay
+instances use the same database.
+
+As the relay operator, pull the deployment's environment into a local file
+and use it to issue invites:
+
+```sh
+vercel env pull .env.pigeon-preview --environment preview
+uv run --env-file .env.pigeon-preview pigeon relay invite @bob/review wss://YOUR_DEPLOYMENT
+```
+
+Use the deployment's reachable hostname in the invite. Keep the environment
+file private. Anyone holding the database credential can administer the relay.
 
 ## Host the relay on Fly.io
 

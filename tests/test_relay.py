@@ -188,3 +188,34 @@ def test_peer_revocation_and_conversation_privacy(relay):
             assert exc.value.code == "unauthenticated"
 
     asyncio.run(exchange())
+
+
+def test_shared_store_preserves_transactions(monkeypatch, tmp_path):
+    import libsql
+
+    from pigeon.db import RemoteStore, token_hash
+
+    connect = libsql.connect
+
+    def local_shared_database(url, **kwargs):
+        assert url == "libsql://relay.example.test"
+        return connect(str(tmp_path / "shared.sqlite3"), **kwargs)
+
+    monkeypatch.setattr(libsql, "connect", local_shared_database)
+    sender = RemoteStore("libsql://relay.example.test", "test-token")
+    recipient = RemoteStore("libsql://relay.example.test", "test-token")
+    alice = sender.enroll(ALICE)
+    recipient.enroll(BOB)
+    assert recipient.authenticate(token_hash(alice)) == ALICE
+    recipient.grant(BOB, ALICE, True)
+    request = Submit(to=BOB, conversation_id=uuid4(), message_id=uuid4(), message="Review this.")
+    sender.submit(ALICE, request)
+    work = recipient.take(BOB)
+    assert work["request"]["id"] == str(request.message_id)
+    assert sender.take(BOB) is None
+    recipient.finish(
+        BOB, Finish(message_id=request.message_id, status="completed", content="Done.")
+    )
+    assert sender.inspect(ALICE, Inspect(conversation_id=request.conversation_id))["status"] == (
+        "completed"
+    )

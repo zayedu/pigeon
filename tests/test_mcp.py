@@ -1,4 +1,5 @@
 import asyncio
+import os
 import subprocess
 import sys
 from stat import S_IMODE
@@ -103,7 +104,20 @@ def test_invite_and_session_reply(relay, tmp_path):
     invite = run_cli(
         receiver, "relay", "invite", "@alice/pr-42", relay.url, "--db", str(relay.store.path)
     ).stdout.strip()
-    run_cli(receiver, "join", "claude", "--session", "--allow", BOB, token=invite + "\n")
+    fake = tmp_path / "claude"
+    fake.write_text(
+        '#!/bin/sh\n[ "$1" = "--mcp-config" ] && [ "$3" = "--resume" ] && [ "$#" = 3 ]\n'
+    )
+    fake.chmod(0o700)
+    subprocess.run(
+        cli(receiver, "join", "claude", "--session", "--allow", BOB),
+        env=os.environ | {"PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]},
+        input=invite + "\n",
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
     assert S_IMODE(receiver.stat().st_mode) == 0o600
 
     async def exchange():

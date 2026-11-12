@@ -12,6 +12,7 @@ classifiers = [
 ]
 dependencies = [
     "fastapi>=0.115,<1",
+    "libsql>=0.1.11,<0.2",
     "mcp>=1.27.1,<2",
     "pydantic>=2.10,<3",
     "typer>=0.16,<1",

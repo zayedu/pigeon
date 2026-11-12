@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import secrets
 import sqlite3
 import time
@@ -127,10 +128,10 @@ class Store:
                 if not count:
                     raise PigeonError("unknown_agent", "Agent is not registered.")
             else:
-                try:
-                    db.execute("INSERT INTO agents VALUES (?, ?)", (name, token_hash(token)))
-                except sqlite3.IntegrityError:
-                    raise PigeonError("registered", "Agent already exists. Use --rotate.") from None
+                if not db.execute(
+                    "INSERT OR IGNORE INTO agents VALUES (?, ?)", (name, token_hash(token))
+                ).rowcount:
+                    raise PigeonError("registered", "Agent already exists. Use --rotate.")
         return token
 
     def revoke(self, name: str):
@@ -337,3 +338,67 @@ class Store:
                 )
                 row = db.execute(query, params).fetchone()
             return render_turn(row)
+
+
+class _RemoteCursor:
+    def __init__(self, cursor):
+        self.cursor = cursor
+        self.rowcount = cursor.rowcount
+        self.columns = [column[0] for column in cursor.description or ()]
+
+    def fetchone(self):
+        row = self.cursor.fetchone()
+        return dict(zip(self.columns, row, strict=True)) if row is not None else None
+
+    def fetchall(self):
+        return [dict(zip(self.columns, row, strict=True)) for row in self.cursor.fetchall()]
+
+
+class _RemoteConnection:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, sql, args=()):
+        return _RemoteCursor(self.connection.execute(sql, tuple(args)))
+
+
+class RemoteStore(Store):
+    def __init__(self, url: str, token: str):
+        if not url.startswith(("libsql://", "https://")) or not token:
+            raise PigeonError("database_config", "Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN.")
+        self.url = url
+        self.token = token
+        with self.transaction() as db:
+            for statement in SCHEMA.split(";"):
+                if statement.strip():
+                    db.execute(statement)
+
+    @contextmanager
+    def transaction(self, *, write: bool = True):
+        import libsql
+
+        connection = None
+        try:
+            connection = libsql.connect(
+                self.url, auth_token=self.token, isolation_level=None, timeout=5
+            )
+            db = _RemoteConnection(connection)
+            db.execute("PRAGMA foreign_keys=ON")
+            if write:
+                db.execute("BEGIN IMMEDIATE")
+            yield db
+            if write:
+                db.execute("COMMIT")
+        except (ValueError, RuntimeError) as exc:
+            raise sqlite3.OperationalError("Shared database request failed.") from exc
+        finally:
+            if connection is not None:
+                connection.close()
+
+
+def open_store(path: Path | None) -> Store:
+    if path is not None:
+        return Store(path)
+    return RemoteStore(
+        os.environ.get("TURSO_DATABASE_URL", ""), os.environ.get("TURSO_AUTH_TOKEN", "")
+    )

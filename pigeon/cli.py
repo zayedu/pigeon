@@ -31,7 +31,7 @@ from .config import (
     validate_token,
 )
 from .daemon import Daemon, Echo, Sessions
-from .db import Store
+from .db import open_store
 from .models import Cancel, Command, Context, Grant, Inspect, ListCalls, PigeonError, Ping, address
 from .server import serve
 
@@ -66,23 +66,25 @@ def start_relay(
 
 
 @relay_app.command()
-def enroll(agent: str, db: Database, rotate: bool = False):
+def enroll(
+    agent: str, db: Annotated[Path | None, typer.Option("--db")] = None, rotate: bool = False
+):
     """Issue a token for an agent. Share it privately."""
-    typer.echo(Store(db).enroll(agent, rotate=rotate))
+    typer.echo(open_store(db).enroll(agent, rotate=rotate))
 
 
 @relay_app.command()
-def invite(agent: str, relay: str, db: Database):
+def invite(agent: str, relay: str, db: Annotated[Path | None, typer.Option("--db")] = None):
     """Create an address and print a private invite to share with its owner."""
     url = relay_endpoint(relay).removesuffix("/v1/ws")
-    token = Store(db).enroll(agent)
+    token = open_store(db).enroll(agent)
     typer.echo(f"{url}#{token}")
 
 
 @relay_app.command("revoke")
-def revoke_token(agent: str, db: Database):
+def revoke_token(agent: str, db: Annotated[Path | None, typer.Option("--db")] = None):
     """Disable an agent's token and cancel its active turns."""
-    Store(db).revoke(address.validate_python(agent))
+    open_store(db).revoke(address.validate_python(agent))
     typer.echo(f"Revoked {agent}.")
 
 
@@ -114,14 +116,17 @@ def login(
     connect_profile(ctx.obj, url, token)
 
 
-def connect_profile(path: Path, url: str, token: str):
+def connect_profile(path: Path, url: str, token: str, *, session_profile: bool = False) -> Path:
     validate_token(token)
 
     async def identify():
         async with open_client(url, token) as client:
             return (await client.call(Ping()))["agent"]
 
-    agent = asyncio.run(identify())
+    agent = address.validate_python(asyncio.run(identify()))
+    if session_profile:
+        owner, name = agent[1:].split("/")
+        path = path.parent / "sessions" / owner / f"{name}.json"
     with config_lock(path):
         if path.exists():
             config = load(path)
@@ -134,6 +139,7 @@ def connect_profile(path: Path, url: str, token: str):
             config = Config(relay=url, agent=agent, token=token)
         save(path, config)
     typer.echo(f"Connected as {agent}.")
+    return path
 
 
 @app.command()
@@ -143,25 +149,31 @@ def join(
     session: bool = False,
     allow: str | None = None,
 ):
-    """Join from a private invite and register Pigeon with your agent."""
-    if session and not allow:
-        raise PigeonError("peer_required", "Pass --allow with the reviewer's Pigeon address.")
-    if allow:
-        address.validate_python(allow)
+    """Join from an invite and connect your coding agent."""
     relay, token = urldefrag(typer.prompt("Paste your Pigeon invite", hide_input=True).strip())
     url = relay_endpoint(relay).removesuffix("/v1/ws")
-    connect_profile(ctx.obj, url, token)
+    if session and not allow:
+        allow = typer.prompt("Reviewer's Pigeon address")
+    if allow:
+        address.validate_python(allow)
+    ctx.obj = connect_profile(
+        ctx.obj, url, token, session_profile=session and ctx.obj == default_config().absolute()
+    )
     if allow:
         set_permission(ctx.obj, allow, True)
     if session:
-        typer.echo(f"Run pigeon session {client} SESSION_ID to reopen the implementing session.")
+        open_session(ctx, client)
     else:
-        install(ctx, client)
+        register_mcp(ctx.obj, client, "local", name="pigeon-relay")
 
 
-@app.command()
-def session(ctx: typer.Context, client: Literal["claude", "codex"], session_id: UUID):
-    """Resume an existing coding session with its Pigeon inbox."""
+@app.command("session")
+def open_session(
+    ctx: typer.Context,
+    client: Literal["claude", "codex"],
+    session_id: Annotated[UUID | None, typer.Argument()] = None,
+):
+    """Open the session picker or resume by ID with the Pigeon inbox."""
     config = load(ctx.obj)
     if not config.allowed:
         raise PigeonError("peer_required", "Allow a reviewer before opening the session inbox.")
@@ -174,10 +186,12 @@ def session(ctx: typer.Context, client: Literal["claude", "codex"], session_id: 
             f"mcp_servers.pigeon-session={{command={json.dumps(sys.executable)},"
             f"args={json.dumps(args)}}}"
         )
-        launch = [binary, "-c", server, "resume", str(session_id)]
+        launch = [binary, "-c", server, "resume"]
     else:
         server = {"mcpServers": {"pigeon-session": {"command": sys.executable, "args": args}}}
-        launch = [binary, "--mcp-config", json.dumps(server), "--resume", str(session_id)]
+        launch = [binary, "--mcp-config", json.dumps(server), "--resume"]
+    if session_id is not None:
+        launch.append(str(session_id))
     raise typer.Exit(subprocess.call(launch))
 
 
@@ -446,21 +460,28 @@ def install(
     scope: Literal["local", "user"] = "local",
 ):
     """Register Pigeon with Codex or Claude Code."""
-    load(ctx.obj)
+    register_mcp(ctx.obj, host, scope, name="pigeon")
+
+
+def register_mcp(path: Path, host: str, scope: str, *, name: str):
+    load(path)
     binary = shutil.which(host)
     if not binary:
         raise PigeonError("client_missing", f"Install {host} and put it on your PATH.")
-    name = "pigeon"
-    command = [sys.executable, "-m", "pigeon.cli", "--config", str(ctx.obj), "mcp"]
+    command = [sys.executable, "-m", "pigeon.cli", "--config", str(path), "mcp"]
+    existing = subprocess.run(
+        [binary, "mcp", "get", name], capture_output=True, text=True, check=False
+    )
+    if existing.returncode == 0:
+        if str(path) in existing.stdout and "pigeon.cli" in existing.stdout:
+            typer.echo(f"Restart {host} to load {name}.")
+            return
+        raise PigeonError(
+            "already_installed", f"{name} is already registered. Check `{host} mcp get {name}`."
+        )
     args = [binary, "mcp", "add"]
     if host == "claude":
         args.extend(["--scope", scope, "--transport", "stdio"])
-    else:
-        existing = subprocess.run([binary, "mcp", "get", name], capture_output=True, check=False)
-        if existing.returncode == 0:
-            raise PigeonError(
-                "already_installed", f"{name} is already registered. Check `codex mcp get {name}`."
-            )
     result = subprocess.run([*args, name, "--", *command], check=False)
     if result.returncode:
         raise PigeonError("install_failed", f"{host} could not register the Pigeon MCP server.")
