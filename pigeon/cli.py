@@ -102,8 +102,12 @@ def login(
         else typer.prompt("Agent token", hide_input=True)
     )
     validate_token(token)
-    config = Config.model_construct(relay=url, token=token)
-    agent = asyncio.run(rpc(config, Ping()))["agent"]
+
+    async def identify():
+        async with open_client(url, token) as client:
+            return (await client.call(Ping()))["agent"]
+
+    agent = asyncio.run(identify())
     with config_lock(ctx.obj):
         if ctx.obj.exists():
             config = load(ctx.obj)
@@ -133,6 +137,8 @@ def expose(
     workspace = repo.resolve() if repo else None
     with config_lock(ctx.obj):
         config = load(ctx.obj)
+        if daemon_running(ctx.obj):
+            raise PigeonError("daemon_running", "Stop the daemon before changing its runtime.")
         if workspace:
             runtime = Codex(workspace, state_path(ctx.obj) / "codex", codex)
             codex = runtime.binary

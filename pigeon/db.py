@@ -95,6 +95,8 @@ class Store:
     def __init__(self, path: Path):
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         path.touch(mode=0o600, exist_ok=True)
+        if path.stat().st_mode & 0o077:
+            raise PigeonError("database_permissions", f"Run chmod 600 on {path}.")
         self.path = path
         with self.transaction(write=False) as db:
             db.execute("PRAGMA journal_mode=WAL")
@@ -238,7 +240,8 @@ class Store:
                     (conversation_id, sender, request.to, now, context),
                 )
             pending = db.execute(
-                TURN + " WHERE t.status IN ('queued', 'running') AND c.recipient=? LIMIT 64",
+                """SELECT 1 FROM turns t JOIN conversations c ON c.id=t.conversation_id
+                   WHERE t.status IN ('queued', 'running') AND c.recipient=? LIMIT 64""",
                 (request.to,),
             ).fetchall()
             if len(pending) >= 64:

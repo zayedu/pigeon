@@ -76,13 +76,22 @@ class Codex:
             "CODEX_HOME": str(self.home),
             "SHELL": "/bin/sh",
         }
-        workspace_key = json.dumps(str(self.workspace), ensure_ascii=False)
-        state_key = json.dumps(str(self.state), ensure_ascii=False)
-        permissions = (
-            'permissions={pigeon={filesystem={":root"="deny",":minimal"="read",'
-            f'{workspace_key}="read",{state_key}="deny"'
-            "},network={enabled=false}}}"
+        filesystem = {
+            ":root": "deny",
+            ":minimal": "read",
+            ":tmpdir": "deny",
+            ":slash_tmp": "deny",
+            str(self.workspace): "read",
+            str(self.state): "deny",
+        }
+        if platform.system() == "Darwin":
+            # Seatbelt's process defaults add scratch access at these physical paths.
+            filesystem.update({"/private/tmp": "deny", "/private/var/tmp": "deny"})
+        rules = ",".join(
+            f"{json.dumps(path, ensure_ascii=False)}={json.dumps(access)}"
+            for path, access in filesystem.items()
         )
+        permissions = f"permissions={{pigeon={{filesystem={{{rules}}},network={{enabled=false}}}}}}"
         config = (
             'default_permissions="pigeon"',
             permissions,
@@ -110,10 +119,14 @@ class Codex:
         self.options = [arg for setting in config for arg in ("-c", setting)]
 
     async def check_sandbox(self):
-        write_probe = self.workspace / f".pigeon-probe-{uuid4().hex}"
+        name = f".pigeon-probe-{uuid4().hex}"
+        write_probe = self.workspace / name
+        scratch = Path("/tmp").resolve()
+        scratch_probe = scratch / name
         with (
             tempfile.NamedTemporaryFile(dir=self.state) as private,
             tempfile.NamedTemporaryFile(dir=self.state.parent) as outside,
+            tempfile.NamedTemporaryFile(dir=scratch) as temporary,
             socket.socket() as listener,
         ):
             listener.bind(("127.0.0.1", 0))
@@ -124,9 +137,11 @@ class Codex:
                 if /bin/cat "$2" >/dev/null 2>&1; then exit 2; fi
                 if /bin/cat "$3" >/dev/null 2>&1; then exit 3; fi
                 if (set -C; : > "$4") 2>/dev/null; then exit 4; fi
-                curl --version >/dev/null || exit 5
-                curl -s --noproxy '*' --max-time 1 "$5" >/dev/null 2>&1
-                exit 0
+                if /bin/cat "$5" >/dev/null 2>&1; then exit 5; fi
+                if (set -C; : > "$6") 2>/dev/null; then exit 6; fi
+                curl --version >/dev/null || exit 7
+                curl -s --noproxy '*' --max-time 1 "$7" >/dev/null 2>&1
+                printf '%s' pigeon-sandbox-ok
             """
             try:
                 async with (
@@ -147,18 +162,25 @@ class Codex:
                         private.name,
                         outside.name,
                         str(write_probe),
+                        temporary.name,
+                        str(scratch_probe),
                         f"http://127.0.0.1:{port}",
                         cwd=self.cwd,
                         env=self.env,
                     ) as process,
                 ):
-                    await process.communicate()
-                    if process.returncode == 0 and not select([listener], [], [], 0)[0]:
+                    stdout, _ = await process.communicate()
+                    if (
+                        process.returncode == 0
+                        and stdout == b"pigeon-sandbox-ok"
+                        and not select([listener], [], [], 0)[0]
+                    ):
                         return
             except (TimeoutError, OSError):
                 pass
             finally:
                 write_probe.unlink(missing_ok=True)
+                scratch_probe.unlink(missing_ok=True)
         raise PigeonError(
             "sandbox_failed",
             "Codex sandbox check failed. Check Codex CLI, curl, and OS sandbox support.",

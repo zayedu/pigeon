@@ -2,6 +2,7 @@ import asyncio
 import ipaddress
 import json
 from contextlib import asynccontextmanager
+from math import ceil
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -115,7 +116,7 @@ class Client:
         )
         until = asyncio.get_running_loop().time() + wait
         while turn.status in ACTIVE:
-            remaining = int(until - asyncio.get_running_loop().time() + 0.999)
+            remaining = ceil(until - asyncio.get_running_loop().time())
             if remaining <= 0:
                 break
             turn = await self.turn(
@@ -157,7 +158,7 @@ async def ask_agent(
                     context=context,
                     conversation_id=conversation_id,
                     message_id=message_id,
-                    wait=max(0, int(until - loop.time())),
+                    wait=max(0, ceil(until - loop.time())),
                 )
         except PigeonError as exc:
             if exc.code not in ("connection", "storage_unavailable"):

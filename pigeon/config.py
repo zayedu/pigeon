@@ -97,7 +97,11 @@ def local_lock(path: Path, *, check_only: bool = False):
 def local_allowlist(path: Path, initial: Config) -> Callable[[], frozenset[str]]:
     def allowed():
         config = load(path)
-        if (config.agent, config.relay) != (initial.agent, initial.relay):
+        if (config.agent, config.relay, config.exposure) != (
+            initial.agent,
+            initial.relay,
+            initial.exposure,
+        ):
             return frozenset()
         return config.allowed
 

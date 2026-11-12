@@ -4,13 +4,24 @@ import sys
 from uuid import uuid4
 
 import pytest
-from conftest import ALICE, BOB
+from conftest import ALICE, BOB, relay_process
 from pydantic import ValidationError
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosedError
 
 from pigeon.client import open_client, relay_endpoint
-from pigeon.models import MAX_FRAME, Context, Grant, Inspect, PigeonError, Submit, Take, command
+from pigeon.models import (
+    MAX_FRAME,
+    Context,
+    Finish,
+    Grant,
+    Inspect,
+    PigeonError,
+    Ping,
+    Submit,
+    Take,
+    command,
+)
 
 
 def test_protocol_validation():
@@ -111,5 +122,67 @@ def test_websocket_rejects_oversized_frames(relay):
             with pytest.raises(ConnectionClosedError) as exc:
                 await socket.recv()
             assert exc.value.rcvd.code == 1009
+
+    asyncio.run(exchange())
+
+
+def test_relay_restart_preserves_queue_without_replaying_claimed_work(identities):
+    store, alice, bob = identities
+
+    async def before_restart(relay):
+        async with open_client(relay, alice) as receiver, open_client(relay, bob) as caller:
+            await receiver.call(Grant(op="allow", sender=BOB))
+            active = await caller.ask(ALICE, "Claimed before restart", wait=0)
+            assert (await receiver.call(Take(wait=0)))["request"]["id"] == str(active.request.id)
+            queued = await caller.ask(ALICE, "Queued before restart", wait=0)
+            return active, queued
+
+    async def after_restart(relay, active, queued):
+        async with open_client(relay, alice) as receiver, open_client(relay, bob) as caller:
+            assert (
+                await caller.turn(Inspect(conversation_id=active.request.conversation_id))
+            ).status == "running"
+            assert (await receiver.call(Take(wait=0)))["request"]["id"] == str(queued.request.id)
+            assert await receiver.call(Take(wait=0)) is None
+            saved = await receiver.call(
+                Finish(message_id=active.request.id, status="completed", content="Recovered result")
+            )
+            assert saved == await receiver.call(
+                Finish(message_id=active.request.id, status="completed", content="Recovered result")
+            )
+            assert (
+                await caller.turn(Inspect(conversation_id=active.request.conversation_id))
+            ).response.content == "Recovered result"
+
+    with relay_process(store) as url:
+        active, queued = asyncio.run(before_restart(url))
+    with relay_process(store) as url:
+        asyncio.run(after_restart(url, active, queued))
+
+
+def test_peer_revocation_and_conversation_privacy(relay):
+    async def exchange():
+        third = relay.store.enroll("@charlie/agent")
+        async with (
+            open_client(relay.url, relay.alice) as receiver,
+            open_client(relay.url, relay.bob) as caller,
+            open_client(relay.url, third) as outsider,
+        ):
+            await receiver.call(Grant(op="allow", sender=BOB))
+            turn = await caller.ask(ALICE, "Private request", wait=0)
+            query = Inspect(conversation_id=turn.request.conversation_id)
+            with pytest.raises(PigeonError) as exc:
+                await outsider.turn(query)
+            assert exc.value.code == "not_found"
+            assert (await receiver.call(Take(wait=0)))["status"] == "running"
+            await receiver.call(Grant(op="deny", sender=BOB))
+            assert (await caller.turn(query)).status == "cancelled"
+            with pytest.raises(PigeonError) as exc:
+                await caller.ask(ALICE, "After deny", wait=0)
+            assert exc.value.code == "forbidden"
+            relay.store.revoke(BOB)
+            with pytest.raises(PigeonError) as exc:
+                await caller.call(Ping())
+            assert exc.value.code == "unauthenticated"
 
     asyncio.run(exchange())
