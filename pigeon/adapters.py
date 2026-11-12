@@ -296,6 +296,9 @@ class Claude:
             "HOME": str(Path.home()),
             "CLAUDE_CONFIG_DIR": str(self.home),
         }
+        for name in ("USER", "LOGNAME", "TMPDIR", "__CF_USER_TEXT_ENCODING"):
+            if name in os.environ:
+                self.env[name] = os.environ[name]
 
     async def check_login(self):
         try:
