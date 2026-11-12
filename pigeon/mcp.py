@@ -18,6 +18,9 @@ from .models import (
     Finish,
     Inspect,
     PigeonError,
+    Redeem,
+    Share,
+    ShareKey,
     Take,
     Turn,
 )
@@ -73,17 +76,53 @@ def create_mcp(
         except PigeonError as exc:
             raise ToolError(str(exc)) from None
 
+    @server.tool()
+    async def pigeon_connect(key: ShareKey) -> str:
+        """Redeem a session key the user received. Use the returned address with pigeon_ask."""
+        try:
+            async with open_client(config.relay, config.token) as client:
+                return (await client.call(Redeem(key=key)))["address"]
+        except PigeonError as exc:
+            raise ToolError(str(exc)) from None
+
     if allowed is not None and claim_session is not None:
-        register_session_tools(server, config, allowed, claim_session)
+        register_session_tools(server, lambda: config, allowed, claim_session)
+    else:
+        shared: Config | None = None
+        share_lock = asyncio.Lock()
+
+        @server.tool()
+        async def pigeon_share() -> str:
+            """Create a one-hour key when the user asks to share this session with a reviewer."""
+            nonlocal shared
+            async with share_lock:
+                if shared is not None:
+                    raise ToolError("This session already has a share key.")
+                try:
+                    async with open_client(config.relay, config.token) as client:
+                        result = await client.call(Share())
+                    shared = Config(
+                        relay=config.relay, agent=result["address"], token=result["token"]
+                    )
+                    return result["key"]
+                except PigeonError as exc:
+                    raise ToolError(str(exc)) from None
+
+        def shared_config() -> Config:
+            if shared is None:
+                raise ToolError("Use pigeon_share before listening for a reviewer.")
+            return shared
+
+        register_session_tools(server, shared_config)
 
     return server
 
 
 def register_session_tools(
     server: FastMCP,
-    config: Config,
-    allowed: Callable[[], frozenset[str]],
-    claim_session: Callable[[], None],
+    get_config: Callable[[], Config],
+    allowed: Callable[[], frozenset[str]] | None = None,
+    claim_session: Callable[[], None] | None = None,
 ):
     lock = asyncio.Lock()
     claimed = False
@@ -97,7 +136,8 @@ def register_session_tools(
         nonlocal claimed, pending
         async with lock:
             try:
-                if not claimed:
+                config = get_config()
+                if claim_session and not claimed:
                     claim_session()
                     claimed = True
                 async with open_client(config.relay, config.token) as client:
@@ -111,7 +151,7 @@ def register_session_tools(
                     if pending is None or pending.status != "running":
                         result = await client.call(Take(wait=wait))
                         pending = Turn.model_validate(result) if result else None
-                    if pending is not None and pending.request.sender not in allowed():
+                    if pending is not None and allowed and pending.request.sender not in allowed():
                         await client.call(
                             Finish(
                                 message_id=pending.request.id,
@@ -132,7 +172,8 @@ def register_session_tools(
             if pending is None or pending.request.id != message_id:
                 raise ToolError("Use pigeon_receive to claim this request first.")
             try:
-                if pending.request.sender not in allowed():
+                config = get_config()
+                if allowed and pending.request.sender not in allowed():
                     raise ToolError("This session has not authorized the sender.")
                 async with open_client(config.relay, config.token) as client:
                     result = Turn.model_validate(

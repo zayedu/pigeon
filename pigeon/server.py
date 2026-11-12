@@ -22,6 +22,8 @@ from .models import (
     ListCalls,
     PigeonError,
     Ping,
+    Redeem,
+    Share,
     Submit,
     Take,
     command,
@@ -121,6 +123,10 @@ def create_app(path: Path | None) -> FastAPI:
                 if shared:
                     await storage(store.expire)
                 return await storage(store.list_calls, agent)
+            case Share():
+                return await storage(store.share, agent)
+            case Redeem():
+                return await storage(store.redeem, agent, frame.key)
             case Ping():
                 return {"agent": agent, "protocol": 1}
         notify()

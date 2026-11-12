@@ -20,6 +20,14 @@ CREATE TABLE IF NOT EXISTS grants (
     sender TEXT REFERENCES agents NOT NULL,
     PRIMARY KEY (recipient, sender)
 );
+CREATE TABLE IF NOT EXISTS session_shares (
+    recipient TEXT PRIMARY KEY REFERENCES agents,
+    owner TEXT NOT NULL REFERENCES agents,
+    key_hash TEXT NOT NULL UNIQUE,
+    expires_at REAL NOT NULL,
+    reviewer TEXT REFERENCES agents
+);
+CREATE INDEX IF NOT EXISTS shares_by_owner ON session_shares(owner, expires_at);
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     sender TEXT REFERENCES agents NOT NULL,
@@ -170,6 +178,42 @@ class Store:
                     (sender, recipient),
                 )
 
+    def share(self, owner: str) -> dict:
+        now = time.time()
+        name = f"{owner.split('/')[0]}/pr-{secrets.token_hex(8)}"
+        key = "pg_" + secrets.token_urlsafe(16)
+        token = secrets.token_urlsafe(32)
+        with self.transaction() as db:
+            if db.execute("SELECT 1 FROM session_shares WHERE recipient=?", (owner,)).fetchone():
+                raise PigeonError("invalid_share", "Share from your main Pigeon identity.")
+            count = db.execute(
+                "SELECT count(*) AS total FROM session_shares WHERE owner=? AND expires_at>?",
+                (owner, now),
+            ).fetchone()["total"]
+            if count >= 10:
+                raise PigeonError("share_limit", "You already have ten active session keys.")
+            db.execute("INSERT INTO agents VALUES (?, ?)", (name, token_hash(token)))
+            db.execute(
+                "INSERT INTO session_shares VALUES (?, ?, ?, ?, NULL)",
+                (name, owner, token_hash(key), now + 3600),
+            )
+        return {"address": name, "key": key, "token": token}
+
+    def redeem(self, reviewer: str, key: str) -> dict:
+        with self.transaction() as db:
+            share = db.execute(
+                "SELECT * FROM session_shares WHERE key_hash=? AND expires_at>?",
+                (token_hash(key), time.time()),
+            ).fetchone()
+            if not share or share["reviewer"] not in (None, reviewer):
+                raise PigeonError("invalid_key", "This session key is invalid, expired, or in use.")
+            db.execute(
+                "UPDATE session_shares SET reviewer=? WHERE recipient=?",
+                (reviewer, share["recipient"]),
+            )
+            db.execute("INSERT OR IGNORE INTO grants VALUES (?, ?)", (share["recipient"], reviewer))
+        return {"address": share["recipient"]}
+
     def expire(self) -> bool:
         with self.transaction() as db:
             result = db.execute(
@@ -214,8 +258,12 @@ class Store:
                 return render_turn(existing)
             if not db.execute(
                 """SELECT 1 FROM grants g JOIN agents a ON a.address=g.recipient
-                   WHERE g.sender=? AND g.recipient=? AND a.token_hash IS NOT NULL""",
-                (sender, request.to),
+                   WHERE g.sender=? AND g.recipient=? AND a.token_hash IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM session_shares s WHERE s.recipient=g.recipient
+                       AND (s.expires_at<=? OR s.reviewer IS NOT g.sender)
+                   )""",
+                (sender, request.to, now),
             ).fetchone():
                 raise PigeonError("forbidden", "Recipient is unavailable or has not allowed you.")
             conversation = db.execute(

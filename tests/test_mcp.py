@@ -5,12 +5,13 @@ import sys
 from stat import S_IMODE
 from uuid import uuid4
 
+import pytest
 from conftest import ALICE, BOB
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from pigeon.client import open_client
-from pigeon.models import Inspect, Submit, Turn
+from pigeon.models import Inspect, PigeonError, Redeem, Submit, Turn
 
 
 def cli(config, *args):
@@ -45,6 +46,10 @@ def test_cli_daemon_and_stdio_mcp(relay, tmp_path):
                 "pigeon_reply",
                 "pigeon_status",
                 "pigeon_cancel",
+                "pigeon_connect",
+                "pigeon_share",
+                "pigeon_receive",
+                "pigeon_answer",
             }
 
             async def call(name, args):
@@ -154,5 +159,50 @@ def test_invite_and_session_reply(relay, tmp_path):
             completed = await caller.turn(Inspect(conversation_id=request.conversation_id))
             assert completed.status == "completed"
             assert completed.response.content == answer
+
+    asyncio.run(exchange())
+
+
+def test_session_key_between_two_chats_with_the_same_profile(relay, tmp_path):
+    from contextlib import AsyncExitStack
+
+    profile = tmp_path / "shared.json"
+    run_cli(profile, "login", relay.url, "--token-stdin", token=relay.alice)
+    executable, *args = cli(profile, "mcp")
+
+    async def exchange():
+        async with asyncio.timeout(15), AsyncExitStack() as stack:
+            chats = []
+            for _ in range(2):
+                streams = await stack.enter_async_context(
+                    stdio_client(StdioServerParameters(command=executable, args=args))
+                )
+                client = await stack.enter_async_context(ClientSession(*streams))
+                await client.initialize()
+                chats.append(client)
+            owner, reviewer = chats
+            shared = await owner.call_tool("pigeon_share", {})
+            key = shared.structuredContent["result"]
+            connected = await reviewer.call_tool("pigeon_connect", {"key": key})
+            destination = connected.structuredContent["result"]
+            async with open_client(relay.url, relay.bob) as stranger:
+                with pytest.raises(PigeonError, match="in use"):
+                    await stranger.call(Redeem(key=key))
+
+            async with asyncio.TaskGroup() as tasks:
+                question = tasks.create_task(
+                    reviewer.call_tool("pigeon_ask", {"to": destination, "message": "Why cache?"})
+                )
+                received = await owner.call_tool("pigeon_receive", {})
+                turn = Turn.model_validate(received.structuredContent["result"])
+                assert turn.request.content == "Why cache?"
+                answer = await owner.call_tool(
+                    "pigeon_answer",
+                    {"message_id": str(turn.request.id), "message": "To save time."},
+                )
+                assert not answer.isError
+            assert Turn.model_validate(question.result().structuredContent).response.content == (
+                "To save time."
+            )
 
     asyncio.run(exchange())

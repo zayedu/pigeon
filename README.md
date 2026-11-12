@@ -25,6 +25,18 @@ uv tool install git+https://github.com/zayedu/pigeon.git
 
 From a clone, use `uv tool install .` or prefix the commands below with `uv run`.
 
+## Connect two open chats
+
+Once Pigeon is configured in both agents, ask the implementing chat to use
+`pigeon_share` and give you its session key. Send that key to the reviewer
+privately. The reviewer tells their agent to use `pigeon_connect` with the key
+and ask their question with `pigeon_ask`.
+
+When the reviewer is ready, tell the implementing agent to use `pigeon_receive`
+and answer with `pigeon_answer`. The first reviewer to redeem a key gets access
+for one hour from when it was created. Two Codex chats can use the same Pigeon
+profile. Each keeps its own session inbox for the life of its MCP connection.
+
 ## Join with an invite
 
 The relay operator runs `pigeon relay invite @bob/review wss://relay.example.com --db relay.sqlite3`

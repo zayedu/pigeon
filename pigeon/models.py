@@ -81,7 +81,19 @@ class Grant(Frame):
     sender: Address
 
 
-Command = Submit | Inspect | Take | Finish | Cancel | ListCalls | Ping | Grant
+class Share(Frame):
+    op: Literal["share"] = "share"
+
+
+ShareKey = Annotated[str, Field(pattern=r"^pg_[A-Za-z0-9_-]{22}$")]
+
+
+class Redeem(Frame):
+    op: Literal["redeem"] = "redeem"
+    key: ShareKey
+
+
+Command = Submit | Inspect | Take | Finish | Cancel | ListCalls | Ping | Grant | Share | Redeem
 command = TypeAdapter(Annotated[Command, Field(discriminator="op")])
 
 
