@@ -96,6 +96,7 @@ class Turn(Frame):
     conversation_created_at: float
     context: Context | None
     detail: str | None
+    follow_up: bool
 
 
 class PigeonError(Exception):

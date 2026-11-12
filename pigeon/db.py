@@ -46,7 +46,10 @@ CREATE INDEX IF NOT EXISTS active_turns ON turns(status, deadline)
 """
 
 TURN = """
-SELECT t.*, c.sender, c.recipient, c.context, c.created_at AS conversation_created_at
+SELECT t.*, c.sender, c.recipient, c.context, c.created_at AS conversation_created_at,
+       EXISTS(SELECT 1 FROM turns earlier
+              WHERE earlier.conversation_id=t.conversation_id AND earlier.rowid<t.rowid)
+          AS follow_up
 FROM turns t JOIN conversations c ON c.id = t.conversation_id
 """
 
@@ -84,6 +87,7 @@ def render_turn(row: sqlite3.Row) -> dict:
         "deadline": row["deadline"],
         "status": row["status"],
         "detail": row["detail"],
+        "follow_up": bool(row["follow_up"]),
     }
 
 
@@ -221,7 +225,7 @@ class Store:
                     raise PigeonError("conflict", "Conversation context is fixed.")
                 previous = db.execute(
                     """SELECT status FROM turns WHERE conversation_id=?
-                       ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                       ORDER BY rowid DESC LIMIT 1""",
                     (conversation_id,),
                 ).fetchone()
                 if previous["status"] != "completed":
@@ -262,7 +266,7 @@ class Store:
             if request.message_id:
                 query += " AND t.id=?"
                 params.append(str(request.message_id))
-            query += " ORDER BY t.created_at DESC, t.rowid DESC LIMIT 1"
+            query += " ORDER BY t.rowid DESC LIMIT 1"
             row = db.execute(query, params).fetchone()
             if not row:
                 raise PigeonError("not_found", "Conversation or message not found.")
@@ -284,7 +288,7 @@ class Store:
                           t.created_at, t.status
                    FROM conversations c JOIN turns t ON t.rowid=(
                        SELECT rowid FROM turns WHERE conversation_id=c.id
-                       ORDER BY created_at DESC, rowid DESC LIMIT 1
+                       ORDER BY rowid DESC LIMIT 1
                    )
                    WHERE c.sender=? OR c.recipient=?
                    ORDER BY t.created_at DESC LIMIT 50""",
@@ -297,7 +301,7 @@ class Store:
             row = db.execute(
                 TURN
                 + """ WHERE c.recipient=? AND t.status='queued' AND t.deadline>?
-                    ORDER BY t.created_at, t.rowid LIMIT 1""",
+                    ORDER BY t.rowid LIMIT 1""",
                 (recipient, time.time()),
             ).fetchone()
             if not row:
@@ -315,6 +319,13 @@ class Store:
                 raise PigeonError("not_found", "Request not found.")
             if row["status"] == "queued":
                 raise PigeonError("conflict", "Request must be claimed before completion.")
+            if row["status"] == "running" and row["deadline"] <= time.time():
+                db.execute(
+                    """UPDATE turns SET status='timed_out',
+                       detail='Deadline elapsed. Execution outcome is unknown.' WHERE id=?""",
+                    (message_id,),
+                )
+                row = db.execute(query, params).fetchone()
             if row["status"] == "running":
                 db.execute(
                     """UPDATE turns SET status=?, response_id=?, response=?, responded_at=?
