@@ -214,13 +214,18 @@ def test_setup_creates_named_profile_without_invite(relay, tmp_path):
     fake = tmp_path / "claude"
     fake.write_text('#!/bin/sh\n[ "$2" = "add" ]\n')
     fake.chmod(0o700)
-    env = os.environ | {"PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]}
+    env = os.environ | {
+        "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+        "CLAUDE_CONFIG_DIR": str(tmp_path / "claude-config"),
+    }
     profile = tmp_path / "william.json"
     args = ("setup", "claude", "--username", "William", "--relay", relay.url)
     subprocess.run(cli(profile, *args), env=env, check=True, capture_output=True, timeout=10)
     config = load(profile)
     assert config.agent == "@william/agent"
     assert S_IMODE(profile.stat().st_mode) == 0o600
+    skill = tmp_path / "claude-config" / "skills" / "pigeon" / "SKILL.md"
+    assert "pigeon_receive" in skill.read_text()
     collision = subprocess.run(
         cli(tmp_path / "other.json", *args), env=env, capture_output=True, text=True, timeout=10
     )
@@ -303,6 +308,8 @@ def test_cursor_setup_preserves_existing_servers(relay, tmp_path):
             capture_output=True,
             timeout=10,
         )
+    skill = tmp_path / ".agents" / "skills" / "pigeon" / "SKILL.md"
+    assert "pigeon_connect" in skill.read_text()
     servers = json.loads(cursor.read_text())["mcpServers"]
     assert servers["other"] == other
     assert servers["pigeon-relay"]["args"][-3:] == ["--config", str(profile), "mcp"]

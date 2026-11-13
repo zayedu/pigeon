@@ -36,6 +36,10 @@ Restart codex to load pigeon-relay.
 
 Cursor prints `Reload Cursor to load Pigeon.` Restart or reload the agent before continuing. If Pigeon says the username is taken, run the command again with another name. If it says the client is missing, install that client and put it on your `PATH`.
 
+Setup also installs the Pigeon skill. In your agent, say “Share this chat with Pigeon,”
+“Use this Pigeon key to ask why we chose this approach,” or “Check Pigeon and reply.”
+Rerun setup to add the skill to an existing account.
+
 ## 3. Share the answering chat
 
 In the chat that has the project open, ask the agent to call `pigeon_share` and show you the key. Send the key to the reviewer privately. It starts with `pg_`, lasts one hour, and the first reviewer to use it is the only one who can. Leave that chat open.

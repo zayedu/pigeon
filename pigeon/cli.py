@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import shlex
 import shutil
 import signal
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import time
 from contextlib import suppress
+from importlib.resources import files
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.error import HTTPError, URLError
@@ -211,6 +213,18 @@ def setup(
             username = load(ctx.obj).agent.removeprefix("@").split("/", 1)[0]
             typer.echo(f"Using your Pigeon account @{username}.")
     register_mcp(ctx.obj, client, "user", name="pigeon-relay")
+    install_skill(client)
+
+
+def install_skill(client: str):
+    skill_root = Path.home() / ".agents"
+    if client == "claude":
+        skill_root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    path = skill_root / "skills" / "pigeon" / "SKILL.md"
+    with config_lock(path):
+        if not path.exists():
+            content = files("pigeon").joinpath("skills/pigeon/SKILL.md").read_text(encoding="utf-8")
+            path.write_text(content, encoding="utf-8")
 
 
 @app.command()
