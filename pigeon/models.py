@@ -80,11 +80,6 @@ class Close(Frame):
     conversation_id: UUID4
 
 
-class Recover(Frame):
-    op: Literal["recover"] = "recover"
-    message_id: UUID4 | None = None
-
-
 class ListCalls(Frame):
     op: Literal["list"] = "list"
 
@@ -125,7 +120,6 @@ Command = (
     | Finish
     | Cancel
     | Close
-    | Recover
     | ListCalls
     | Ping
     | Grant

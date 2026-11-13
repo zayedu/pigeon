@@ -285,14 +285,10 @@ def test_chat_can_reinvite_and_answer_after_mcp_restart(relay, tmp_path):
                 claimed = await owner.call_tool("pigeon_receive", {"wait": 0})
                 assert claimed.structuredContent["result"]["status"] == "running"
 
-            with relay.store.transaction() as db:
-                db.execute("UPDATE turns SET claimed_at=0 WHERE status='running'")
             async with stdio_client(params) as streams, ClientSession(*streams) as owner:
                 await owner.initialize()
                 restored = await owner.call_tool("pigeon_receive", {"wait": 0})
-                assert restored.structuredContent["result"]["request"]["id"] == str(
-                    question.request.id
-                )
+                assert restored.structuredContent == {"result": None}
                 answer = await owner.call_tool(
                     "pigeon_answer",
                     {
@@ -363,7 +359,9 @@ def test_shared_chat_wakes_without_calling_receive(relay, tmp_path):
         ):
             await owner.initialize()
             share = await owner.call_tool("pigeon_share", {})
-            target = await reviewer.call(Redeem(key=share.structuredContent["result"], peer_session=True))
+            target = await reviewer.call(
+                Redeem(key=share.structuredContent["result"], peer_session=True)
+            )
             question = await reviewer.turn(
                 Submit(
                     to=target["address"],
@@ -461,7 +459,9 @@ def test_native_claude_wake_uses_the_sharing_sessions_inbox(relay, tmp_path, mon
             await owner.initialize()
             share = await owner.call_tool("pigeon_share", {})
             assert "wake listener is attached" in share.content[1].text
-            target = await reviewer.call(Redeem(key=share.structuredContent["result"], peer_session=True))
+            target = await reviewer.call(
+                Redeem(key=share.structuredContent["result"], peer_session=True)
+            )
             question = await reviewer.turn(
                 Submit(
                     to=target["address"],
@@ -697,6 +697,19 @@ def test_two_chats_alternate_follow_ups_and_keep_separate_sessions(relay, tmp_pa
             ambiguous = await bob.call_tool("pigeon_ask", {"message": "Which session?"})
             assert ambiguous.isError
             assert "several sessions" in ambiguous.content[0].text
+            closed = await bob.call_tool(
+                "pigeon_close", {"conversation_id": str(first.request.conversation_id)}
+            )
+            assert not closed.isError
+            async with asyncio.TaskGroup() as tasks:
+                ask = tasks.create_task(bob.call_tool("pigeon_ask", {"message": "Still open?"}))
+                received = await alice.call_tool("pigeon_receive", {})
+                request = received.structuredContent["result"]["request"]
+                assert request["conversation_id"] != str(first.request.conversation_id)
+                await alice.call_tool(
+                    "pigeon_answer", {"message_id": request["id"], "message": "Yes."}
+                )
+            assert not ask.result().isError
             denied = await stranger.call_tool(
                 "pigeon_status", {"conversation_id": str(first.request.conversation_id)}
             )

@@ -40,8 +40,7 @@ underscores. Each part starts with a letter or number and has up to 32 character
 The state moves from `queued` to `running` when the recipient claims it.
 Terminal states are `completed`, `failed`, `timed_out`, and `cancelled`.
 A wake notification is a client attempt to surface a queued request. It is
-not a relay state, and it does not mean the request ran. Claiming work is a
-separate recovery step and does not by itself send another wake.
+not a relay state, and it does not mean the request ran.
 
 A conversation has two members. Either member can submit a new message ID
 after the previous turn is terminal. Context stays fixed. Only one turn per
@@ -56,9 +55,10 @@ legacy conversations for that direction. It does not close an invitation
 session. `close` closes one invitation session, cancels its active turn, and
 leaves its history readable. Another session between the same chats stays
 open. A follow-up in a legacy conversation still requires the recipient's
-grant. `take` claims a queued request. `recover` returns a claimed shared-chat
-request only after its claim hold has lapsed, so a second live client does
-not receive it immediately.
+grant. New clients pass `peer_session: true` when redeeming a key. Older
+clients redeem to a directional grant and supply their own conversation ID.
+`take` only delivers queued requests. After reconnecting, a chat can still
+finish a claimed request by its original message ID.
 
 Retry an ambiguous submission with the original message ID and payload.
 Repeat a result submission with the original message ID if the connection

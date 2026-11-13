@@ -27,7 +27,6 @@ from .models import (
     Inspect,
     ListCalls,
     PigeonError,
-    Recover,
     Redeem,
     ShareKey,
     Take,
@@ -121,7 +120,7 @@ def create_mcp(
         lines = []
         for row in rows:
             peer = peer_of(actor, row) or row["sender"]
-            status = row["status"] or "open"
+            status = "closed" if row.get("closed") else row["status"] or "open"
             lines.append(f"{peer} {status} {row['conversation_id']}")
         return "\n".join(lines)
 
@@ -141,9 +140,9 @@ def create_mcp(
             if other is None:
                 return None
             return conversation_id, other
-        matches = sessions
+        matches = [row for row in sessions if not row.get("closed")]
         if peer is not None:
-            matches = [row for row in sessions if peer_of(actor, row) == peer]
+            matches = [row for row in matches if peer_of(actor, row) == peer]
         if len(matches) == 1:
             other = peer_of(actor, matches[0])
             if other is None:
@@ -284,7 +283,7 @@ def create_mcp(
             else:
                 actor = await ensure_chat(ctx, create=True)
             async with open_client(actor.relay, actor.token) as client:
-                return (await client.call(Redeem(key=key)))["address"]
+                return (await client.call(Redeem(key=key, peer_session=not daemon)))["address"]
         except PigeonError as exc:
             raise ToolError(str(exc)) from None
 
@@ -431,8 +430,6 @@ def register_session_tools(
                         )
                     if pending is None or pending.status != "running":
                         result = await client.call(Take(wait=wait))
-                        if not result:
-                            result = await client.call(Recover())
                         pending = Turn.model_validate(result) if result else None
                     if pending is not None and allowed and pending.request.sender not in allowed():
                         await client.call(
