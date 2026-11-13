@@ -26,6 +26,7 @@ from .models import (
     Inspect,
     ListCalls,
     PigeonError,
+    Recover,
     Redeem,
     ShareKey,
     Take,
@@ -415,6 +416,8 @@ def register_session_tools(
                         )
                     if pending is None or pending.status != "running":
                         result = await client.call(Take(wait=wait))
+                        if not result:
+                            result = await client.call(Recover())
                         pending = Turn.model_validate(result) if result else None
                     if pending is not None and allowed and pending.request.sender not in allowed():
                         await client.call(
