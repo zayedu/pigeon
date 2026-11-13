@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -15,8 +16,21 @@ from mcp.client.stdio import stdio_client
 from websockets.asyncio.server import unix_serve
 
 from pigeon.client import open_client
-from pigeon.models import Finish, Inspect, PigeonError, Redeem, Submit, Take, Turn
-from pigeon.wake import WAKE_PROMPT, native_codex_wake
+from pigeon.config import Config
+from pigeon.models import (
+    Cancel,
+    Context,
+    Finish,
+    Inspect,
+    PigeonError,
+    Redeem,
+    Share,
+    Submit,
+    Take,
+    Turn,
+    Watch,
+)
+from pigeon.wake import WAKE_PROMPT, listen, native_codex_wake
 
 
 def cli(config, *args):
@@ -27,6 +41,41 @@ def run_cli(config, *args, token=None):
     return subprocess.run(
         cli(config, *args), input=token, text=True, capture_output=True, check=True, timeout=10
     )
+
+
+def test_failed_wake_leaves_the_request_queued(relay):
+    async def exchange():
+        token = secrets.token_urlsafe(32)
+
+        async def fail():
+            raise OSError("notify failed")
+
+        async with open_client(relay.url, relay.alice) as owner:
+            shared = await owner.call(Share(session_id=uuid4(), session_token=token))
+        async with open_client(relay.url, relay.bob) as reviewer:
+            target = await reviewer.call(Redeem(key=shared["key"]))
+            await reviewer.turn(
+                Submit(
+                    to=target["address"],
+                    conversation_id=target["conversation_id"],
+                    message_id=uuid4(),
+                    message="Still queued after a failed wake.",
+                )
+            )
+        config = Config(relay=relay.url, token=token, agent=shared["address"])
+        task = asyncio.create_task(listen(config, fail))
+        await asyncio.sleep(0.4)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        async with open_client(relay.url, token) as inbox:
+            pending = await inbox.call(Watch(wait=0))
+            assert pending["message_id"]
+            claimed = await inbox.call(Take(wait=0))
+            assert claimed["status"] == "running"
+            assert claimed["request"]["content"] == "Still queued after a failed wake."
+
+    asyncio.run(exchange())
 
 
 def test_cli_daemon_and_stdio_mcp(relay, tmp_path):
@@ -57,52 +106,34 @@ def test_cli_daemon_and_stdio_mcp(relay, tmp_path):
                 "pigeon_answer",
             }
 
-            async def call(name, args):
-                response = await mcp.call_tool(f"pigeon_{name}", args)
-                assert not response.isError, response.content
-                body = response.structuredContent
-                if name == "status" and "result" in body:
-                    body = body["result"]
-                return Turn.model_validate(body)
-
-            first = await call(
-                "ask",
-                {
-                    "to": ALICE,
-                    "message": "Why cache?",
-                    "context": {"type": "github_pr", "repo": "alice/project", "number": 42},
-                },
-            )
-            assert first.response.content == "First turn: Why cache?"
-            ids = {
-                "conversation_id": str(first.request.conversation_id),
-                "message_id": str(first.request.id),
-            }
-            assert await call("status", ids) == first
-            follow_up = await call(
-                "reply",
-                {
-                    "conversation_id": ids["conversation_id"],
-                    "message": "For how long?",
-                },
-            )
-            assert follow_up.response.content == "Follow-up: For how long?"
-            assert follow_up.context == first.context
-            daemon.terminate()
-            assert daemon.wait(timeout=5) == 0
+            refused = await mcp.call_tool("pigeon_ask", {"to": ALICE, "message": "Why cache?"})
+            assert refused.isError
+            assert "cannot identify this chat" in refused.content[0].text
 
             async with open_client(relay.url, relay.bob) as caller:
+                first = await caller.ask(
+                    ALICE,
+                    "Why cache?",
+                    context=Context(type="github_pr", repo="alice/project", number=42),
+                )
+                assert first.response.content == "First turn: Why cache?"
+                follow_up = await caller.ask(
+                    ALICE, "For how long?", conversation_id=first.request.conversation_id
+                )
+                assert follow_up.response.content == "Follow-up: For how long?"
+                assert follow_up.context == first.context
+                daemon.terminate()
+                assert daemon.wait(timeout=5) == 0
                 queued = await caller.turn(
                     Submit(to=ALICE, message="cancel", conversation_id=uuid4(), message_id=uuid4())
                 )
-            cancelled = await call(
-                "cancel",
-                {
-                    "conversation_id": str(queued.request.conversation_id),
-                    "message_id": str(queued.request.id),
-                },
-            )
-            assert cancelled.status == "cancelled"
+                cancelled = await caller.call(
+                    Cancel(
+                        conversation_id=queued.request.conversation_id,
+                        message_id=queued.request.id,
+                    )
+                )
+                assert cancelled["status"] == "cancelled"
 
     try:
         asyncio.run(exchange())
@@ -183,7 +214,13 @@ def test_session_key_between_two_chats_with_the_same_profile(relay, tmp_path):
             chats = []
             for _ in range(2):
                 streams = await stack.enter_async_context(
-                    stdio_client(StdioServerParameters(command=executable, args=args))
+                    stdio_client(
+                        StdioServerParameters(
+                            command=executable,
+                            args=args,
+                            env={"CLAUDE_CODE_SESSION_ID": f"chat-{len(chats)}"},
+                        )
+                    )
                 )
                 client = await stack.enter_async_context(ClientSession(*streams))
                 await client.initialize()
@@ -229,18 +266,17 @@ def test_chat_can_reinvite_and_answer_after_mcp_restart(relay, tmp_path):
             async with stdio_client(params) as streams, ClientSession(*streams) as owner:
                 await owner.initialize()
                 first = (await owner.call_tool("pigeon_share", {})).structuredContent["result"]
-                async with open_client(relay.url, relay.alice) as test_client:
-                    test_target = await test_client.call(Redeem(key=first))
+                async with open_client(relay.url, relay.alice) as owner_account:
+                    with pytest.raises(PigeonError, match="other chat"):
+                        await owner_account.call(Redeem(key=first))
                 second = (await owner.call_tool("pigeon_share", {})).structuredContent["result"]
                 assert second != first
                 target = await reviewer.call(Redeem(key=second))
-                assert target["address"] == test_target["address"]
-                assert target["conversation_id"] != test_target["conversation_id"]
                 assert target == await reviewer.call(Redeem(key=second))
                 question = await reviewer.turn(
                     Submit(
                         to=target["address"],
-                        conversation_id=uuid4(),
+                        conversation_id=target["conversation_id"],
                         message_id=uuid4(),
                         message="Can you still answer after reconnecting?",
                     )
@@ -328,7 +364,7 @@ def test_shared_chat_wakes_without_calling_receive(relay, tmp_path):
             question = await reviewer.turn(
                 Submit(
                     to=target["address"],
-                    conversation_id=uuid4(),
+                    conversation_id=target["conversation_id"],
                     message_id=uuid4(),
                     message="Why is this private detail here?",
                 )
@@ -398,13 +434,18 @@ def test_native_claude_wake_uses_the_sharing_sessions_inbox(relay, tmp_path, mon
 
         monkeypatch.setenv("CLAUDE_CODE_MESSAGING_SOCKET", socket)
         monkeypatch.setenv("CLAUDE_CODE_MESSAGING_TOKEN", "local-test-token")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "claude-owner")
         executable, *args = cli(profile, "mcp")
         params = StdioServerParameters(
             command=executable,
             args=args,
             env={
                 key: os.environ[key]
-                for key in ("CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN")
+                for key in (
+                    "CLAUDE_CODE_MESSAGING_SOCKET",
+                    "CLAUDE_CODE_MESSAGING_TOKEN",
+                    "CLAUDE_CODE_SESSION_ID",
+                )
             },
         )
         async with (
@@ -421,7 +462,7 @@ def test_native_claude_wake_uses_the_sharing_sessions_inbox(relay, tmp_path, mon
             question = await reviewer.turn(
                 Submit(
                     to=target["address"],
-                    conversation_id=uuid4(),
+                    conversation_id=target["conversation_id"],
                     message_id=uuid4(),
                     message="Reviewer content stays in the relay.",
                 )
@@ -481,6 +522,7 @@ def test_claude_channel_wakes_the_sharing_session(relay, tmp_path):
             *cli(profile, "mcp", "--claude-channel"),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
+            env=os.environ | {"CLAUDE_CODE_SESSION_ID": "channel-owner"},
         )
 
         async def send(message):
@@ -512,7 +554,7 @@ def test_claude_channel_wakes_the_sharing_session(relay, tmp_path):
                 question = await reviewer.turn(
                     Submit(
                         to=target["address"],
-                        conversation_id=uuid4(),
+                        conversation_id=target["conversation_id"],
                         message_id=uuid4(),
                         message="The reviewer text stays in the relay.",
                     )
@@ -634,6 +676,11 @@ def test_two_chats_alternate_follow_ups_and_keep_separate_sessions(relay, tmp_pa
             third = await exchange_turn(
                 alice, bob, "pigeon_reply", "Does the test cover expiry?", "It does."
             )
+            unknown = await alice.call_tool(
+                "pigeon_ask", {"to": "@alice/agent", "message": "Start another thread?"}
+            )
+            assert unknown.isError
+            assert "no matching session" in unknown.content[0].text
             assert first.request.conversation_id == second.request.conversation_id
             assert third.request.conversation_id == first.request.conversation_id
 

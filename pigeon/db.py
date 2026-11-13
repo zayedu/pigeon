@@ -92,11 +92,15 @@ SELECT t.id, t.conversation_id, t.request, t.submitted_context, t.timeout, t.cre
 FROM turns t JOIN conversations c ON c.id = t.conversation_id
 """
 
-INBOX = """
- WHERE COALESCE(t.recipient, c.recipient)=? AND t.deadline>? AND (t.status='queued' OR (
-        t.status='running' AND EXISTS (
+QUEUED = """
+ WHERE COALESCE(t.recipient, c.recipient)=? AND t.deadline>? AND t.status='queued'
+ ORDER BY t.rowid LIMIT 1"""
+
+RECOVER = """
+ WHERE COALESCE(t.recipient, c.recipient)=? AND t.deadline>? AND (
+        t.status='queued' OR (t.status='running' AND EXISTS (
             SELECT 1 FROM shared_chats s WHERE s.recipient=?)))
- ORDER BY (t.status='running') DESC, t.rowid LIMIT 1"""
+ ORDER BY (t.status='queued') DESC, t.rowid LIMIT 1"""
 
 
 def token_hash(token: str) -> str:
@@ -250,10 +254,14 @@ class Store:
                 db.execute("DELETE FROM grants WHERE recipient=? AND sender=?", (recipient, sender))
                 db.execute(
                     """UPDATE turns SET status='cancelled', detail='Peer authorization revoked.'
-                       WHERE status IN ('queued', 'running') AND conversation_id IN
-                       (SELECT id FROM conversations
-                        WHERE (sender=? AND recipient=?) OR (sender=? AND recipient=?))""",
-                    (sender, recipient, recipient, sender),
+                       WHERE status IN ('queued', 'running') AND conversation_id IN (
+                           SELECT c.id FROM conversations c
+                           WHERE c.sender=? AND c.recipient=?
+                           AND NOT EXISTS (
+                               SELECT 1 FROM chat_invites i WHERE i.conversation_id=c.id
+                           )
+                       )""",
+                    (sender, recipient),
                 )
 
     def share(self, owner: str, session_id=None, session_token=None, resume=False) -> dict:
@@ -352,6 +360,11 @@ class Store:
             if not share:
                 raise PigeonError("invalid_key", "This session key is invalid, expired, or in use.")
             inbox = share["recipient"]
+            owner = db.execute(
+                "SELECT owner FROM session_shares WHERE recipient=?", (inbox,)
+            ).fetchone()
+            if reviewer == inbox or (owner and reviewer == owner["owner"]):
+                raise PigeonError("invalid_key", "Open the other chat and join with this key.")
             if invite:
                 db.execute(
                     """UPDATE chat_invites SET reviewer=?
@@ -386,8 +399,6 @@ class Store:
                     "UPDATE session_shares SET reviewer=? WHERE recipient=?", (reviewer, inbox)
                 )
                 conversation_id = None
-            db.execute("INSERT OR IGNORE INTO grants VALUES (?, ?)", (inbox, reviewer))
-            db.execute("INSERT OR IGNORE INTO grants VALUES (?, ?)", (reviewer, inbox))
         result = {"address": inbox}
         if conversation_id:
             result["conversation_id"] = conversation_id
@@ -442,19 +453,14 @@ class Store:
                 members = {conversation["sender"], conversation["recipient"]}
                 if sender not in members or request.to not in members or sender == request.to:
                     raise PigeonError("not_found", "Conversation not found.")
-                allowed = db.execute(
-                    """SELECT 1 FROM grants g
-                       JOIN agents sender_agent ON sender_agent.address=?
-                       JOIN agents recipient_agent ON recipient_agent.address=g.recipient
-                       WHERE g.sender=? AND g.recipient=?
-                       AND sender_agent.token_hash IS NOT NULL
-                       AND recipient_agent.token_hash IS NOT NULL""",
-                    (sender, sender, request.to),
-                ).fetchone()
-                if not allowed:
-                    raise PigeonError(
-                        "forbidden", "Recipient is unavailable or has not allowed you."
-                    )
+                for member in (sender, request.to):
+                    row = db.execute(
+                        "SELECT token_hash FROM agents WHERE address=?", (member,)
+                    ).fetchone()
+                    if not row or row["token_hash"] is None:
+                        raise PigeonError(
+                            "forbidden", "Recipient is unavailable or has not allowed you."
+                        )
                 if conversation["context"] is None and context is not None:
                     db.execute(
                         "UPDATE conversations SET context=? WHERE id=?", (context, conversation_id)
@@ -470,6 +476,11 @@ class Store:
                     raise PigeonError(
                         "conflict", "Follow-ups require a completed turn. Check its status."
                     )
+            elif db.execute(
+                "SELECT 1 FROM shared_chats WHERE recipient=? OR recipient=?",
+                (sender, request.to),
+            ).fetchone():
+                raise PigeonError("forbidden", "Use the session created by the invitation.")
             elif not db.execute(
                 """SELECT 1 FROM grants g JOIN agents a ON a.address=g.recipient
                    WHERE g.sender=? AND g.recipient=? AND a.token_hash IS NOT NULL
@@ -558,12 +569,12 @@ class Store:
 
     def next_message(self, recipient: str) -> dict | None:
         with self.transaction(write=False) as db:
-            row = db.execute(TURN + INBOX, (recipient, time.time(), recipient)).fetchone()
+            row = db.execute(TURN + QUEUED, (recipient, time.time())).fetchone()
         return {"message_id": row["id"], "deadline": row["deadline"]} if row else None
 
     def take(self, recipient: str) -> dict | None:
         with self.transaction() as db:
-            row = db.execute(TURN + INBOX, (recipient, time.time(), recipient)).fetchone()
+            row = db.execute(TURN + RECOVER, (recipient, time.time(), recipient)).fetchone()
             if not row:
                 return None
             db.execute("UPDATE turns SET status='running' WHERE id=?", (row["id"],))
