@@ -1,6 +1,5 @@
 import asyncio
 import os
-import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from functools import partial
@@ -25,6 +24,7 @@ from .models import (
     Context,
     Finish,
     Inspect,
+    ListCalls,
     PigeonError,
     Redeem,
     ShareKey,
@@ -79,65 +79,206 @@ def create_mcp(
 
     server_class = ClaudeChannel if claude_channel else FastMCP
     server = server_class("Pigeon", lifespan=lifespan)
+    daemon = allowed is not None and claim_session is not None
+    bound_chat_id: str | None = None
+    rebind_hooks: list[Callable[[], None]] = []
 
-    @server.tool()
-    async def pigeon_ask(to: Address, message: Content, context: Context | None = None) -> Turn:
-        """Ask a trusted agent a question. Use pigeon_status if the turn is still active."""
+    def chat_id_for(ctx: MCPContext) -> str | None:
+        meta = ctx.request_context.meta
+        codex = meta.model_dump().get("x-codex-turn-metadata") if meta else None
+        thread = (
+            str(codex_wake[1])
+            if codex_wake
+            else (codex.get("thread_id") if isinstance(codex, dict) else None)
+        )
+        session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        chat_id = f"codex:{thread}" if thread else f"claude:{session}" if session else None
+        if cursor_endpoint is not None:
+            session_file = Path(cursor_endpoint).with_suffix(".session")
+            if session_file.is_file():
+                chat_id = f"cursor:{session_file.read_text(encoding='utf-8').strip()}"
+        return chat_id
+
+    async def list_sessions(actor: Config) -> list[dict]:
+        async with open_client(actor.relay, actor.token) as client:
+            return await client.call(ListCalls())
+
+    def peer_of(actor: Config, row: dict) -> str | None:
+        if row["sender"] == actor.agent:
+            return row["recipient"]
+        if row["recipient"] == actor.agent:
+            return row["sender"]
+        return None
+
+    def format_sessions(actor: Config, rows: list[dict]) -> str:
+        lines = []
+        for row in rows:
+            peer = peer_of(actor, row) or row["sender"]
+            status = row["status"] or "open"
+            lines.append(f"{peer} {status} {row['conversation_id']}")
+        return "\n".join(lines)
+
+    async def choose_session(
+        actor: Config,
+        sessions: list[dict],
+        conversation_id: UUID | None,
+        peer: str | None,
+    ) -> tuple[UUID, str] | None:
+        if conversation_id is not None:
+            matches = [row for row in sessions if row["conversation_id"] == str(conversation_id)]
+            if not matches:
+                return None
+            other = peer_of(actor, matches[0])
+            if peer is not None and peer != other:
+                raise ToolError("That session does not include the peer you named.")
+            if other is None:
+                return None
+            return conversation_id, other
+        matches = sessions
+        if peer is not None:
+            matches = [row for row in sessions if peer_of(actor, row) == peer]
+        if len(matches) == 1:
+            other = peer_of(actor, matches[0])
+            if other is None:
+                return None
+            return UUID(matches[0]["conversation_id"]), other
+        if len(matches) > 1:
+            raise ToolError(
+                "This chat has several sessions. Say which peer to use:\n"
+                + format_sessions(actor, matches)
+            )
+        return None
+
+    async def resolve_actor(ctx: MCPContext, *, create: bool = False) -> Config:
+        if daemon:
+            return config
         try:
-            return await ask_agent(config.relay, config.token, message, to=to, context=context)
+            return await ensure_chat(ctx, create=create)
         except PigeonError as exc:
-            raise ToolError(str(exc)) from None
+            if exc.code != "not_found":
+                raise
+            if chat_id_for(ctx):
+                raise ToolError("This chat has no sessions.") from None
+            return config
+
+    async def resolve_send(
+        ctx: MCPContext,
+        *,
+        conversation_id: UUID | None,
+        peer: str | None,
+        create: bool,
+    ) -> tuple[Config, UUID | None, str | None]:
+        actors: list[Config] = []
+        if not daemon:
+            try:
+                actors.append(await ensure_chat(ctx, create=create))
+            except PigeonError as exc:
+                if exc.code != "not_found":
+                    raise
+        if not actors:
+            # A host chat with no inbox must not inherit another chat's account sessions.
+            if chat_id_for(ctx):
+                raise ToolError("No session in this chat matches that request.")
+            actors.append(config)
+        for actor in actors:
+            try:
+                sessions = await list_sessions(actor)
+            except PigeonError:
+                continue
+            chosen = await choose_session(actor, sessions, conversation_id, peer)
+            if chosen is not None:
+                return actor, chosen[0], chosen[1]
+        if conversation_id is None and peer is not None:
+            return actors[0], None, peer
+        raise ToolError("No session in this chat matches that request.")
 
     @server.tool()
-    async def pigeon_reply(conversation_id: UUID, message: Content) -> Turn:
-        """Continue a conversation you started with pigeon_ask after it completed."""
+    async def pigeon_ask(
+        ctx: MCPContext,
+        message: Content,
+        to: Address | None = None,
+        context: Context | None = None,
+        conversation_id: UUID | None = None,
+    ) -> Turn:
+        """Ask the other member of a session. Omit the address when this chat has one session."""
         try:
+            actor, session_id, peer = await resolve_send(
+                ctx, conversation_id=conversation_id, peer=to, create=False
+            )
+            if peer is None:
+                raise ToolError("Say which session to use, or share a key and join first.")
             return await ask_agent(
-                config.relay, config.token, message, conversation_id=conversation_id
+                actor.relay,
+                actor.token,
+                message,
+                to=peer,
+                context=context,
+                conversation_id=session_id,
             )
         except PigeonError as exc:
-            if exc.code == "not_found" and shared is not None:
-                try:
-                    async with open_client(shared.relay, shared.token) as client:
-                        await client.turn(Inspect(conversation_id=conversation_id))
-                except PigeonError:
-                    pass
-                else:
-                    raise ToolError(
-                        "The reviewer started this conversation. They can send follow-ups "
-                        "with pigeon_reply. Use pigeon_answer for an incoming request."
-                    ) from None
             raise ToolError(str(exc)) from None
 
     @server.tool()
-    async def pigeon_status(conversation_id: UUID, message_id: UUID | None = None) -> Turn:
-        """Read the latest turn or look up a specific message in a conversation."""
+    async def pigeon_reply(
+        ctx: MCPContext, message: Content, conversation_id: UUID | None = None
+    ) -> Turn:
+        """Ask a follow-up in a session this chat belongs to, in either direction."""
         try:
-            async with open_client(config.relay, config.token) as client:
-                return await client.turn(
-                    Inspect(conversation_id=conversation_id, message_id=message_id)
-                )
+            actor, session_id, _peer = await resolve_send(
+                ctx, conversation_id=conversation_id, peer=None, create=False
+            )
+            if session_id is None:
+                raise ToolError("No session in this chat matches that request.")
+            return await ask_agent(actor.relay, actor.token, message, conversation_id=session_id)
         except PigeonError as exc:
             raise ToolError(str(exc)) from None
 
     @server.tool()
-    async def pigeon_cancel(conversation_id: UUID, message_id: UUID) -> Turn:
-        """Cancel an active request you sent. Use the request ID as message_id."""
+    async def pigeon_status(
+        ctx: MCPContext,
+        conversation_id: UUID | None = None,
+        message_id: UUID | None = None,
+    ) -> Turn | dict:
+        """Show this chat's sessions, or read one session when you pass its id."""
         try:
-            async with open_client(config.relay, config.token) as client:
+            if conversation_id is None:
+                actor = await resolve_actor(ctx)
+                sessions = await list_sessions(actor)
+                return {
+                    "summary": format_sessions(actor, sessions) or "This chat has no sessions.",
+                    "sessions": sessions,
+                }
+            actor, session_id, _peer = await resolve_send(
+                ctx, conversation_id=conversation_id, peer=None, create=False
+            )
+            async with open_client(actor.relay, actor.token) as client:
+                return await client.turn(Inspect(conversation_id=session_id, message_id=message_id))
+        except PigeonError as exc:
+            raise ToolError(str(exc)) from None
+
+    @server.tool()
+    async def pigeon_cancel(ctx: MCPContext, conversation_id: UUID, message_id: UUID) -> Turn:
+        """Cancel an active request this chat sent. Use the request ID as message_id."""
+        try:
+            actor, session_id, _peer = await resolve_send(
+                ctx, conversation_id=conversation_id, peer=None, create=False
+            )
+            async with open_client(actor.relay, actor.token) as client:
                 return Turn.model_validate(
-                    await client.call(
-                        Cancel(conversation_id=conversation_id, message_id=message_id)
-                    )
+                    await client.call(Cancel(conversation_id=session_id, message_id=message_id))
                 )
         except PigeonError as exc:
             raise ToolError(str(exc)) from None
 
     @server.tool()
-    async def pigeon_connect(key: ShareKey) -> str:
-        """Redeem a session key the user received. Use the returned address with pigeon_ask."""
+    async def pigeon_connect(ctx: MCPContext, key: ShareKey) -> str:
+        """Join a session with a key. Either chat can then ask or answer."""
         try:
-            async with open_client(config.relay, config.token) as client:
+            if daemon:
+                actor = config
+            else:
+                actor = await ensure_chat(ctx, create=True)
+            async with open_client(actor.relay, actor.token) as client:
                 return (await client.call(Redeem(key=key)))["address"]
         except PigeonError as exc:
             raise ToolError(str(exc)) from None
@@ -149,27 +290,30 @@ def create_mcp(
         identity = None
 
         async def open_inbox(ctx: MCPContext, *, resume: bool = False):
-            nonlocal shared, listener, identity
+            nonlocal shared, listener, identity, bound_chat_id
             async with share_lock:
+                chat_id = chat_id_for(ctx)
+                if bound_chat_id != chat_id:
+                    for hook in rebind_hooks:
+                        hook()
+                    if listener is not None:
+                        listener.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await listener
+                        listener = None
+                    shared = None
+                    identity = None
+                    bound_chat_id = chat_id
                 if resume and shared is not None:
-                    return
-                meta = ctx.request_context.meta
-                codex = meta.model_dump().get("x-codex-turn-metadata") if meta else None
-                thread = (
-                    str(codex_wake[1])
-                    if codex_wake
-                    else (codex.get("thread_id") if isinstance(codex, dict) else None)
-                )
-                session = os.environ.get("CLAUDE_CODE_SESSION_ID")
-                chat_id = f"codex:{thread}" if thread else f"claude:{session}" if session else None
-                if cursor_endpoint is not None:
-                    session_file = Path(cursor_endpoint).with_suffix(".session")
-                    if session_file.is_file():
-                        chat_id = f"cursor:{session_file.read_text(encoding='utf-8')}"
+                    return shared
                 if identity is None:
                     if resume and chat_id is None:
                         raise PigeonError("not_found", "Share this chat before checking its inbox.")
                     identity = chat_share(profile, config, chat_id)
+                codex = None
+                meta = ctx.request_context.meta
+                if meta:
+                    codex = meta.model_dump().get("x-codex-turn-metadata")
                 async with open_client(config.relay, config.token) as client:
                     result = await client.call(identity.model_copy(update={"resume": resume}))
                 shared = Config(relay=config.relay, agent=result["address"], token=result["token"])
@@ -192,11 +336,20 @@ def create_mcp(
                     with suppress(asyncio.CancelledError):
                         await listener
                     listener = None
-                if notify is not None and result["expires_at"] > time.time():
-                    listener = asyncio.create_task(
-                        listen(shared, notify, expires_at=result["expires_at"])
-                    )
+                if notify is not None:
+                    listener = asyncio.create_task(listen(shared, notify))
                 return result, listener is not None
+
+        async def ensure_chat(ctx: MCPContext, *, create: bool) -> Config:
+            try:
+                await open_inbox(ctx, resume=True)
+            except PigeonError as exc:
+                if not create or exc.code != "not_found":
+                    raise
+                await open_inbox(ctx, resume=False)
+            if shared is None:
+                raise PigeonError("not_found", "Share this chat before checking its inbox.")
+            return shared
 
         @server.tool()
         async def pigeon_share(ctx: MCPContext) -> Annotated[CallToolResult, str]:
@@ -218,7 +371,15 @@ def create_mcp(
                 structuredContent={"result": result["key"]},
             )
 
-        register_session_tools(server, lambda: shared, restore=partial(open_inbox, resume=True))
+        def watch_rebind(hook: Callable[[], None]):
+            rebind_hooks.append(hook)
+
+        register_session_tools(
+            server,
+            lambda: shared,
+            restore=partial(open_inbox, resume=True),
+            on_rebind=watch_rebind,
+        )
 
     return server
 
@@ -229,10 +390,18 @@ def register_session_tools(
     allowed: Callable[[], frozenset[str]] | None = None,
     claim_session: Callable[[], None] | None = None,
     restore=None,
+    on_rebind: Callable[[Callable[[], None]], None] | None = None,
 ):
     lock = asyncio.Lock()
     claimed = False
     pending: Turn | None = None
+
+    def clear_pending():
+        nonlocal pending
+        pending = None
+
+    if on_rebind is not None:
+        on_rebind(clear_pending)
 
     @server.tool()
     async def pigeon_receive(
@@ -243,9 +412,11 @@ def register_session_tools(
         nonlocal claimed, pending
         async with lock:
             try:
-                if restore is not None and get_config() is None:
+                if restore is not None:
                     await restore(ctx)
                 config = get_config()
+                if config is None:
+                    raise PigeonError("not_found", "Share this chat before checking its inbox.")
                 if claim_session and not claimed:
                     claim_session()
                     claimed = True
@@ -281,9 +452,11 @@ def register_session_tools(
             if claim_session and (pending is None or pending.request.id != message_id):
                 raise ToolError("Use pigeon_receive to claim this request first.")
             try:
-                if restore is not None and get_config() is None:
+                if restore is not None:
                     await restore(ctx)
                 config = get_config()
+                if config is None:
+                    raise PigeonError("not_found", "Share this chat before checking its inbox.")
                 if allowed and pending.request.sender not in allowed():
                     raise ToolError("This session has not authorized the sender.")
                 async with open_client(config.relay, config.token) as client:
