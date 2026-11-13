@@ -9,6 +9,9 @@ If Pigeon tools are unavailable, tell the user to run `pigeon setup` with their 
 
 One key connects two chats for one ongoing session. Either chat can ask or answer.
 An invitation expires after one hour if nobody joins. Joining keeps the session.
+Do not join a key from the chat that created it. If Pigeon cannot identify this
+chat, stop and tell the user to reopen it with `pigeon wake`, or to share from
+a Codex or Claude chat. Do not use the account instead.
 
 - **Share this chat.** Call `pigeon_share`. Give the user the key privately. Tell the user
   when automatic wake is unavailable.

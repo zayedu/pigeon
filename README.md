@@ -118,7 +118,9 @@ enable that channel for the session.
 
 Say “Ask them …” or “Answer their question” in either chat. Say “Show my
 sessions” when a chat has more than one; Pigeon will not guess which peer you
-mean. Say “Check Pigeon” to read the inbox without waiting for a wake.
+mean. A chat Pigeon cannot identify does not fall back to the account. Say
+“Check Pigeon” to read the inbox without waiting for a wake. Wake reports a
+new question. Reopening a chat does not run a question that was already claimed.
 
 Pigeon prompts a chat automatically when wake is enabled for that client.
 Wake tells the agent a question is waiting. The agent still has to read it and
