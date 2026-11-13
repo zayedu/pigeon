@@ -72,17 +72,51 @@ CREATE INDEX IF NOT EXISTS active_turns ON turns(status, deadline)
     WHERE status IN ('queued', 'running');
 """
 
+MIGRATIONS = (
+    "ALTER TABLE turns ADD COLUMN sender TEXT",
+    "ALTER TABLE turns ADD COLUMN recipient TEXT",
+    "ALTER TABLE chat_invites ADD COLUMN conversation_id TEXT",
+    """CREATE UNIQUE INDEX IF NOT EXISTS one_open_turn
+       ON turns(conversation_id) WHERE status IN ('queued', 'running')""",
+)
+
 TURN = """
-SELECT t.*, c.sender, c.recipient, c.context, c.created_at AS conversation_created_at,
+SELECT t.id, t.conversation_id, t.request, t.submitted_context, t.timeout, t.created_at,
+       t.deadline, t.status, t.response_id, t.response, t.responded_at, t.detail,
+       COALESCE(t.sender, c.sender) AS sender,
+       COALESCE(t.recipient, c.recipient) AS recipient,
+       c.context, c.created_at AS conversation_created_at,
        EXISTS(SELECT 1 FROM turns earlier
               WHERE earlier.conversation_id=t.conversation_id AND earlier.rowid<t.rowid)
           AS follow_up
 FROM turns t JOIN conversations c ON c.id = t.conversation_id
 """
 
+INBOX = """
+ WHERE COALESCE(t.recipient, c.recipient)=? AND t.deadline>? AND (t.status='queued' OR (
+        t.status='running' AND EXISTS (
+            SELECT 1 FROM shared_chats s WHERE s.recipient=?)))
+ ORDER BY (t.status='running') DESC, t.rowid LIMIT 1"""
+
 
 def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def apply_schema(db):
+    script = getattr(db, "executescript", None)
+    if script:
+        script(SCHEMA)
+    else:
+        for statement in SCHEMA.split(";"):
+            if statement.strip():
+                db.execute(statement)
+    for statement in MIGRATIONS:
+        try:
+            db.execute(statement)
+        except (sqlite3.OperationalError, ValueError) as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
 
 
 def render_turn(row: sqlite3.Row) -> dict:
@@ -127,7 +161,7 @@ class Store:
         self.path = path
         with self.transaction(write=False) as db:
             db.execute("PRAGMA journal_mode=WAL")
-            db.executescript(SCHEMA)
+            apply_schema(db)
 
     @contextmanager
     def transaction(self, *, write: bool = True):
@@ -217,8 +251,9 @@ class Store:
                 db.execute(
                     """UPDATE turns SET status='cancelled', detail='Peer authorization revoked.'
                        WHERE status IN ('queued', 'running') AND conversation_id IN
-                       (SELECT id FROM conversations WHERE sender=? AND recipient=?)""",
-                    (sender, recipient),
+                       (SELECT id FROM conversations
+                        WHERE (sender=? AND recipient=?) OR (sender=? AND recipient=?))""",
+                    (sender, recipient, recipient, sender),
                 )
 
     def share(self, owner: str, session_id=None, session_token=None, resume=False) -> dict:
@@ -294,38 +329,69 @@ class Store:
                         (name,),
                     )
                 db.execute(
-                    "INSERT INTO chat_invites VALUES (?, ?, ?, NULL)",
+                    """INSERT INTO chat_invites
+                       (key_hash, recipient, expires_at, reviewer)
+                       VALUES (?, ?, ?, NULL)""",
                     (token_hash(key), name, expires),
                 )
         return {"address": name, "key": key, "token": token, "expires_at": expires}
 
     def redeem(self, reviewer: str, key: str) -> dict:
+        digest = token_hash(key)
+        now = time.time()
         with self.transaction() as db:
             invite = db.execute(
-                "SELECT * FROM chat_invites WHERE key_hash=? AND expires_at>?",
-                (token_hash(key), time.time()),
+                "SELECT * FROM chat_invites WHERE key_hash=? AND expires_at>?", (digest, now)
             ).fetchone()
             share = (
                 invite
                 or db.execute(
-                    "SELECT * FROM session_shares WHERE key_hash=? AND expires_at>?",
-                    (token_hash(key), time.time()),
+                    "SELECT * FROM session_shares WHERE key_hash=? AND expires_at>?", (digest, now)
                 ).fetchone()
             )
-            if not share or share["reviewer"] not in (None, reviewer):
+            if not share:
                 raise PigeonError("invalid_key", "This session key is invalid, expired, or in use.")
+            inbox = share["recipient"]
             if invite:
                 db.execute(
-                    "UPDATE chat_invites SET reviewer=? WHERE key_hash=?",
-                    (reviewer, token_hash(key)),
+                    """UPDATE chat_invites SET reviewer=?
+                       WHERE key_hash=? AND reviewer IS NULL""",
+                    (reviewer, digest),
                 )
+                current = db.execute(
+                    "SELECT reviewer, conversation_id FROM chat_invites WHERE key_hash=?",
+                    (digest,),
+                ).fetchone()
+                if current["reviewer"] != reviewer:
+                    raise PigeonError(
+                        "invalid_key", "This session key is invalid, expired, or in use."
+                    )
+                conversation_id = current["conversation_id"]
+                if not conversation_id:
+                    conversation_id = str(uuid4())
+                    db.execute(
+                        "INSERT INTO conversations VALUES (?, ?, ?, ?, NULL)",
+                        (conversation_id, inbox, reviewer, now),
+                    )
+                    db.execute(
+                        "UPDATE chat_invites SET conversation_id=? WHERE key_hash=?",
+                        (conversation_id, digest),
+                    )
             else:
+                if share["reviewer"] not in (None, reviewer):
+                    raise PigeonError(
+                        "invalid_key", "This session key is invalid, expired, or in use."
+                    )
                 db.execute(
-                    "UPDATE session_shares SET reviewer=? WHERE recipient=?",
-                    (reviewer, share["recipient"]),
+                    "UPDATE session_shares SET reviewer=? WHERE recipient=?", (reviewer, inbox)
                 )
-            db.execute("INSERT OR IGNORE INTO grants VALUES (?, ?)", (share["recipient"], reviewer))
-        return {"address": share["recipient"]}
+                conversation_id = None
+            db.execute("INSERT OR IGNORE INTO grants VALUES (?, ?)", (inbox, reviewer))
+            db.execute("INSERT OR IGNORE INTO grants VALUES (?, ?)", (reviewer, inbox))
+        result = {"address": inbox}
+        if conversation_id:
+            result["conversation_id"] = conversation_id
+        return result
 
     def expire(self) -> bool:
         with self.transaction() as db:
@@ -369,7 +435,42 @@ class Store:
                 if submitted != stored:
                     raise PigeonError("conflict", "Message ID is already in use.")
                 return render_turn(existing)
-            if not db.execute(
+            conversation = db.execute(
+                "SELECT * FROM conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            if conversation:
+                members = {conversation["sender"], conversation["recipient"]}
+                if sender not in members or request.to not in members or sender == request.to:
+                    raise PigeonError("not_found", "Conversation not found.")
+                allowed = db.execute(
+                    """SELECT 1 FROM grants g
+                       JOIN agents sender_agent ON sender_agent.address=?
+                       JOIN agents recipient_agent ON recipient_agent.address=g.recipient
+                       WHERE g.sender=? AND g.recipient=?
+                       AND sender_agent.token_hash IS NOT NULL
+                       AND recipient_agent.token_hash IS NOT NULL""",
+                    (sender, sender, request.to),
+                ).fetchone()
+                if not allowed:
+                    raise PigeonError(
+                        "forbidden", "Recipient is unavailable or has not allowed you."
+                    )
+                if conversation["context"] is None and context is not None:
+                    db.execute(
+                        "UPDATE conversations SET context=? WHERE id=?", (context, conversation_id)
+                    )
+                elif context is not None and context != conversation["context"]:
+                    raise PigeonError("conflict", "Conversation context is fixed.")
+                previous = db.execute(
+                    """SELECT status FROM turns WHERE conversation_id=?
+                       ORDER BY rowid DESC LIMIT 1""",
+                    (conversation_id,),
+                ).fetchone()
+                if previous and previous["status"] in ("queued", "running"):
+                    raise PigeonError(
+                        "conflict", "Follow-ups require a completed turn. Check its status."
+                    )
+            elif not db.execute(
                 """SELECT 1 FROM grants g JOIN agents a ON a.address=g.recipient
                    WHERE g.sender=? AND g.recipient=? AND a.token_hash IS NOT NULL
                    AND NOT EXISTS (
@@ -381,23 +482,6 @@ class Store:
                 (sender, request.to, now),
             ).fetchone():
                 raise PigeonError("forbidden", "Recipient is unavailable or has not allowed you.")
-            conversation = db.execute(
-                "SELECT * FROM conversations WHERE id=?", (conversation_id,)
-            ).fetchone()
-            if conversation:
-                if (conversation["sender"], conversation["recipient"]) != (sender, request.to):
-                    raise PigeonError("not_found", "Conversation not found.")
-                if context is not None and context != conversation["context"]:
-                    raise PigeonError("conflict", "Conversation context is fixed.")
-                previous = db.execute(
-                    """SELECT status FROM turns WHERE conversation_id=?
-                       ORDER BY rowid DESC LIMIT 1""",
-                    (conversation_id,),
-                ).fetchone()
-                if previous["status"] != "completed":
-                    raise PigeonError(
-                        "conflict", "Follow-ups require a completed turn. Check its status."
-                    )
             else:
                 db.execute(
                     "INSERT INTO conversations VALUES (?, ?, ?, ?, ?)",
@@ -405,25 +489,34 @@ class Store:
                 )
             pending = db.execute(
                 """SELECT 1 FROM turns t JOIN conversations c ON c.id=t.conversation_id
-                   WHERE t.status IN ('queued', 'running') AND c.recipient=? LIMIT 64""",
+                   WHERE t.status IN ('queued', 'running')
+                   AND COALESCE(t.recipient, c.recipient)=? LIMIT 64""",
                 (request.to,),
             ).fetchall()
             if len(pending) >= 64:
                 raise PigeonError("busy", "Recipient's queue is full. Try again later.")
-            db.execute(
-                """INSERT INTO turns
-                   (id, conversation_id, request, submitted_context, timeout, created_at, deadline)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    message_id,
-                    conversation_id,
-                    request.message,
-                    context,
-                    request.timeout,
-                    now,
-                    now + request.timeout,
-                ),
-            )
+            try:
+                db.execute(
+                    """INSERT INTO turns
+                       (id, conversation_id, request, submitted_context, timeout,
+                        created_at, deadline, sender, recipient)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        message_id,
+                        conversation_id,
+                        request.message,
+                        context,
+                        request.timeout,
+                        now,
+                        now + request.timeout,
+                        sender,
+                        request.to,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                raise PigeonError(
+                    "conflict", "Follow-ups require a completed turn. Check its status."
+                ) from None
             return render_turn(db.execute(TURN + " WHERE t.id=?", (message_id,)).fetchone())
 
     def inspect(self, agent: str, request: Inspect | Cancel) -> dict:
@@ -452,41 +545,25 @@ class Store:
         with self.transaction(write=False) as db:
             rows = db.execute(
                 """SELECT c.id AS conversation_id, c.sender, c.recipient, t.id AS message_id,
-                          t.created_at, t.status
-                   FROM conversations c JOIN turns t ON t.rowid=(
+                          COALESCE(t.created_at, c.created_at) AS created_at, t.status
+                   FROM conversations c LEFT JOIN turns t ON t.rowid=(
                        SELECT rowid FROM turns WHERE conversation_id=c.id
                        ORDER BY rowid DESC LIMIT 1
                    )
                    WHERE c.sender=? OR c.recipient=?
-                   ORDER BY t.created_at DESC LIMIT 50""",
+                   ORDER BY created_at DESC LIMIT 50""",
                 (agent, agent),
             ).fetchall()
         return [dict(row) for row in rows]
 
     def next_message(self, recipient: str) -> dict | None:
         with self.transaction(write=False) as db:
-            row = db.execute(
-                TURN
-                + """ WHERE c.recipient=? AND t.deadline>? AND (t.status='queued' OR (
-                        t.status='running' AND EXISTS (
-                            SELECT 1 FROM shared_chats c WHERE c.recipient=?
-                        )))
-                    ORDER BY (t.status='running') DESC, t.rowid LIMIT 1""",
-                (recipient, time.time(), recipient),
-            ).fetchone()
+            row = db.execute(TURN + INBOX, (recipient, time.time(), recipient)).fetchone()
         return {"message_id": row["id"], "deadline": row["deadline"]} if row else None
 
     def take(self, recipient: str) -> dict | None:
         with self.transaction() as db:
-            row = db.execute(
-                TURN
-                + """ WHERE c.recipient=? AND t.deadline>? AND (t.status='queued' OR (
-                        t.status='running' AND EXISTS (
-                            SELECT 1 FROM shared_chats c WHERE c.recipient=?
-                        )))
-                    ORDER BY (t.status='running') DESC, t.rowid LIMIT 1""",
-                (recipient, time.time(), recipient),
-            ).fetchone()
+            row = db.execute(TURN + INBOX, (recipient, time.time(), recipient)).fetchone()
             if not row:
                 return None
             db.execute("UPDATE turns SET status='running' WHERE id=?", (row["id"],))
@@ -495,7 +572,7 @@ class Store:
     def finish(self, recipient: str, result: Finish) -> dict:
         message_id = str(result.message_id)
         with self.transaction() as db:
-            query = TURN + " WHERE t.id=? AND c.recipient=?"
+            query = TURN + " WHERE t.id=? AND COALESCE(t.recipient, c.recipient)=?"
             params = (message_id, recipient)
             row = db.execute(query, params).fetchone()
             if not row:
@@ -548,9 +625,7 @@ class RemoteStore(Store):
         self.url = url
         self.token = token
         with self.transaction() as db:
-            for statement in SCHEMA.split(";"):
-                if statement.strip():
-                    db.execute(statement)
+            apply_schema(db)
 
     @contextmanager
     def transaction(self, *, write: bool = True):

@@ -231,7 +231,9 @@ def test_chat_can_reinvite_and_answer_after_mcp_restart(relay, tmp_path):
                 second = (await owner.call_tool("pigeon_share", {})).structuredContent["result"]
                 assert second != first
                 target = await reviewer.call(Redeem(key=second))
-                assert target == test_target == await reviewer.call(Redeem(key=second))
+                assert target["address"] == test_target["address"]
+                assert target["conversation_id"] != test_target["conversation_id"]
+                assert target == await reviewer.call(Redeem(key=second))
                 question = await reviewer.turn(
                     Submit(
                         to=target["address"],

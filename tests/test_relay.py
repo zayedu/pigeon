@@ -1,4 +1,6 @@
 import asyncio
+import secrets
+import sqlite3
 import subprocess
 import sys
 from uuid import uuid4
@@ -18,6 +20,8 @@ from pigeon.models import (
     Inspect,
     PigeonError,
     Ping,
+    Redeem,
+    Share,
     Submit,
     Take,
     command,
@@ -219,3 +223,154 @@ def test_shared_store_preserves_transactions(monkeypatch, tmp_path):
     assert sender.inspect(ALICE, Inspect(conversation_id=request.conversation_id))["status"] == (
         "completed"
     )
+
+
+def test_peers_alternate_after_the_invitation_expires(relay):
+    async def exchange():
+        token = secrets.token_urlsafe(32)
+        async with open_client(relay.url, relay.alice) as owner:
+            shared = await owner.call(Share(session_id=uuid4(), session_token=token))
+        async with open_client(relay.url, relay.bob) as joiner:
+            joined = await joiner.call(Redeem(key=shared["key"]))
+            conversation_id = joined["conversation_id"]
+            first = await joiner.turn(
+                Submit(
+                    to=joined["address"],
+                    conversation_id=conversation_id,
+                    message_id=uuid4(),
+                    message="Can you see this?",
+                )
+            )
+        async with open_client(relay.url, token) as inbox:
+            claimed = await inbox.call(Take(wait=0))
+            assert claimed["request"]["content"] == "Can you see this?"
+            await inbox.call(
+                Finish(message_id=first.request.id, status="completed", content="Yes.")
+            )
+            reverse = await inbox.turn(
+                Submit(
+                    to=BOB,
+                    conversation_id=conversation_id,
+                    message_id=uuid4(),
+                    message="What changed?",
+                )
+            )
+        async with open_client(relay.url, relay.bob) as joiner:
+            incoming = await joiner.call(Take(wait=0))
+            assert incoming["request"]["id"] == str(reverse.request.id)
+            await joiner.call(
+                Finish(message_id=reverse.request.id, status="completed", content="The index.")
+            )
+            again = await joiner.turn(
+                Submit(
+                    to=joined["address"],
+                    conversation_id=conversation_id,
+                    message_id=uuid4(),
+                    message="And after that?",
+                )
+            )
+        with sqlite3.connect(relay.store.path) as db:
+            db.execute("UPDATE session_shares SET expires_at=0")
+            db.execute("UPDATE chat_invites SET expires_at=0")
+        async with open_client(relay.url, token) as inbox:
+            assert (await inbox.call(Take(wait=0)))["request"]["id"] == str(again.request.id)
+            await inbox.call(
+                Finish(message_id=again.request.id, status="completed", content="Still here.")
+            )
+            continued = await inbox.turn(
+                Submit(
+                    to=BOB,
+                    conversation_id=conversation_id,
+                    message_id=uuid4(),
+                    message="Membership outlives the key.",
+                )
+            )
+            assert continued.request.sender == joined["address"]
+        async with open_client(relay.url, relay.bob) as joiner:
+            with pytest.raises(PigeonError) as exc:
+                await joiner.call(Redeem(key=shared["key"]))
+            assert exc.value.code == "invalid_key"
+            delivered = await joiner.call(Take(wait=0))
+            assert delivered["request"]["content"] == "Membership outlives the key."
+            assert delivered["status"] == "running"
+
+    asyncio.run(exchange())
+
+
+def test_one_invitation_accepts_one_joiner(relay):
+    async def exchange():
+        charlie = relay.store.enroll("@charlie/agent")
+        async with open_client(relay.url, relay.alice) as owner:
+            shared = await owner.call(
+                Share(session_id=uuid4(), session_token=secrets.token_urlsafe(32))
+            )
+
+        async def redeem(token):
+            try:
+                async with open_client(relay.url, token) as client:
+                    return await client.call(Redeem(key=shared["key"]))
+            except PigeonError as exc:
+                return exc
+
+        first, second = await asyncio.gather(redeem(relay.bob), redeem(charlie))
+        results = {type(item) for item in (first, second)}
+        assert results == {dict, PigeonError}
+        error = first if isinstance(first, PigeonError) else second
+        assert error.code == "invalid_key"
+
+    asyncio.run(exchange())
+
+
+def test_simultaneous_follow_ups_do_not_both_land(relay):
+    async def exchange():
+        async with open_client(relay.url, relay.alice) as receiver:
+            await receiver.call(Grant(op="allow", sender=BOB))
+        conversation_id = uuid4()
+
+        async def send(text):
+            try:
+                async with open_client(relay.url, relay.bob) as caller:
+                    return await caller.turn(
+                        Submit(
+                            to=ALICE,
+                            conversation_id=conversation_id,
+                            message_id=uuid4(),
+                            message=text,
+                        )
+                    )
+            except PigeonError as exc:
+                return exc
+
+        results = await asyncio.gather(send("One"), send("Two"))
+        assert sum(isinstance(item, PigeonError) for item in results) == 1
+        assert any(getattr(item, "code", None) == "conflict" for item in results)
+
+    asyncio.run(exchange())
+
+
+def test_legacy_turn_direction_survives_adding_columns(tmp_path):
+    from pigeon.db import Store
+
+    path = tmp_path / "legacy.sqlite3"
+    store = Store(path)
+    store.enroll(ALICE)
+    store.enroll(BOB)
+    store.grant(BOB, ALICE, True)
+    conversation_id = str(uuid4())
+    message_id = str(uuid4())
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "INSERT INTO conversations VALUES (?, ?, ?, ?, NULL)",
+            (conversation_id, ALICE, BOB, 1),
+        )
+        db.execute(
+            """INSERT INTO turns
+               (id, conversation_id, request, timeout, created_at, deadline, status)
+               VALUES (?, ?, ?, 30, 1, 9999999999, 'queued')""",
+            (message_id, conversation_id, "Legacy question"),
+        )
+    again = Store(path)
+    turn = again.inspect(ALICE, Inspect(conversation_id=conversation_id))
+    assert turn["request"]["sender"] == ALICE
+    assert turn["request"]["recipient"] == BOB
+    assert turn["status"] == "queued"
