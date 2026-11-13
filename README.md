@@ -50,16 +50,15 @@ Check Pigeon and reply to the pending request.
 
 Rerun setup if you add another client or need to repair its MCP configuration.
 
-## 3. Share the answering chat
+## 3. Share a chat
 
-Ask the agent that should answer to share its current chat with Pigeon. It will
-return a short key. Send that key privately to the reviewer. Each key lasts one
-hour and can be redeemed once; ask the agent for a fresh key to invite another
-reviewer to the same chat.
+Ask one agent to share its current chat. It returns a short key. Send that key
+privately. The key lasts one hour and admits one other chat. Say “Start a new
+session” for another key. An existing session stays up after its key expires.
 
-The reviewer gives the key to their own agent in natural language. The reviewer
-does not need to know your username or run a relay command. The agent connects,
-asks its question, and Pigeon delivers it to the answering chat.
+The other person gives the key to their own agent: “Join with this key.” They
+do not need your username. Either chat can send the first message, and either
+can keep asking follow-ups in that same session.
 
 If either agent was already open during setup, restart it. To update later:
 
@@ -115,13 +114,13 @@ Only use `pigeon wake claude` as a diagnostic fallback when the native inbox is
 not available. It uses Claude's development Channels preview and will ask you to
 enable that channel for the session.
 
-## 4. Ask
+## 4. Talk
 
-In the reviewer's chat, ask the agent to call `pigeon_connect` with the key, then `pigeon_ask` with the address it returns. That address looks like `@<username>/pr-…`.
+Say “Ask them …” or “Answer their question” in either chat. Say “Show my
+sessions” when a chat has more than one; Pigeon will not guess which peer you
+mean. Say “Check Pigeon” to read the inbox without waiting for a wake.
 
-Pigeon prompts the answering chat automatically when wake is enabled.
-In other chats, say “Check Pigeon and reply.”
-
-The original caller can use `pigeon_reply` to ask a follow-up in the same
-conversation. To ask in the reverse direction, share the other agent's chat
-and start a conversation using its key.
+Pigeon prompts a chat automatically when wake is enabled for that client.
+Wake tells the agent a question is waiting. The agent still has to read it and
+answer. An answer does not start another question. If wake is unavailable,
+“Check Pigeon” still works.
