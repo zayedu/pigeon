@@ -53,12 +53,24 @@ pigeon wake <THREAD_ID>
 `<THREAD_ID>` is the UUID of that Codex thread. Ask the reopened chat to share.
 Keep the CLI chat running so Pigeon can prompt it when a question arrives.
 
+For **Cursor CLI** or **Claude Code**, open the answering chat from its project directory:
+
+```sh
+pigeon wake cursor
+pigeon wake claude
+```
+
+Add a saved session ID after the client name to resume a conversation. Close the
+previous session before resuming it. Cursor runs in Pigeon's terminal through ACP.
+Claude Code opens its normal terminal and asks you to opt into the Pigeon
+development channel for that session. Your Anthropic account or organization
+must allow Channels. Share the chat after it opens and keep it running.
+
 ## 4. Ask
 
 In the reviewer's chat, ask the agent to call `pigeon_connect` with the key, then `pigeon_ask` with the address it returns. That address looks like `@<username>/pr-…`.
 
-In Codex desktop, Cursor desktop, or Claude Code, ask the answering agent to call
-`pigeon_receive` and reply with `pigeon_answer`. When the answering chat was opened
-with `pigeon wake`, Pigeon sends that prompt automatically.
+When the answering chat was opened with `pigeon wake`, Pigeon prompts it automatically.
+In other chats, say “Check Pigeon and reply.”
 
 Use `pigeon_reply` to ask a follow-up in the same conversation.

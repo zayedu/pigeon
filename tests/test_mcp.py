@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from mcp.client.stdio import stdio_client
 
 from pigeon.client import open_client
 from pigeon.models import Inspect, PigeonError, Redeem, Submit, Turn
+from pigeon.wake import WAKE_PROMPT
 
 
 def cli(config, *args):
@@ -284,6 +286,67 @@ def test_shared_chat_wakes_without_calling_receive(relay, tmp_path):
             assert Turn.model_validate(received.structuredContent["result"]).request.id == (
                 question.request.id
             )
+
+    asyncio.run(exchange())
+
+
+def test_claude_channel_wakes_the_sharing_session(relay, tmp_path):
+    profile = tmp_path / "owner.json"
+    run_cli(profile, "login", relay.url, "--token-stdin", token=relay.alice)
+
+    async def exchange():
+        proc = await asyncio.create_subprocess_exec(
+            *cli(profile, "mcp", "--claude-channel"),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+        )
+
+        async def send(message):
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", **message}).encode() + b"\n")
+            await proc.stdin.drain()
+
+        try:
+            async with asyncio.timeout(10), open_client(relay.url, relay.bob) as reviewer:
+                await send(
+                    {
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-06-18",
+                            "clientInfo": {"name": "test", "version": "1"},
+                            "capabilities": {},
+                        },
+                    }
+                )
+                initialized = json.loads(await proc.stdout.readline())
+                assert initialized["result"]["capabilities"]["experimental"] == {
+                    "claude/channel": {}
+                }
+                await send({"method": "notifications/initialized"})
+                await send({"id": 2, "method": "tools/call", "params": {"name": "pigeon_share"}})
+                share = json.loads(await proc.stdout.readline())
+                key = share["result"]["structuredContent"]["result"]
+                target = await reviewer.call(Redeem(key=key))
+                question = await reviewer.turn(
+                    Submit(
+                        to=target["address"],
+                        conversation_id=uuid4(),
+                        message_id=uuid4(),
+                        message="The reviewer text stays in the relay.",
+                    )
+                )
+                assert json.loads(await proc.stdout.readline()) == {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/claude/channel",
+                    "params": {"content": WAKE_PROMPT},
+                }
+                assert (
+                    await reviewer.turn(Inspect(conversation_id=question.request.conversation_id))
+                ).status == "queued"
+        finally:
+            proc.stdin.close()
+            async with asyncio.timeout(5):
+                await proc.wait()
 
     asyncio.run(exchange())
 

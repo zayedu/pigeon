@@ -253,10 +253,50 @@ def join(
 
 
 @app.command()
-def wake(ctx: typer.Context, thread: UUID):
-    """Resume a Codex chat with automatic Pigeon notifications."""
+def wake(
+    ctx: typer.Context,
+    client_or_thread: str,
+    session_id: Annotated[str | None, typer.Argument()] = None,
+):
+    """Open a wake-enabled chat in Codex, Claude Code, or Cursor."""
     ctx.obj = setup_profile(ctx)
     load(ctx.obj)
+    if client_or_thread == "cursor":
+        from .cursor_acp import run_cursor
+
+        binary = shutil.which("agent") or shutil.which("cursor-agent")
+        if not binary:
+            raise PigeonError("client_missing", "Install and sign in to Cursor CLI first.")
+        asyncio.run(run_cursor(binary, ctx.obj, session_id))
+        return
+    if client_or_thread == "claude":
+        binary = shutil.which("claude")
+        if not binary:
+            raise PigeonError("client_missing", "Install and sign in to Claude Code first.")
+        args = ["-m", "pigeon.cli", "--config", str(ctx.obj), "mcp", "--claude-channel"]
+        config = {"mcpServers": {"pigeon-relay": {"command": sys.executable, "args": args}}}
+        launch = [
+            binary,
+            "--mcp-config",
+            json.dumps(config),
+            "--dangerously-load-development-channels",
+            "server:pigeon-relay",
+        ]
+        if session_id:
+            launch.extend(["--resume", session_id])
+        raise typer.Exit(subprocess.call(launch))
+    try:
+        if session_id is not None and client_or_thread != "codex":
+            raise ValueError
+        thread = UUID((session_id or "") if client_or_thread == "codex" else client_or_thread)
+    except ValueError:
+        raise typer.BadParameter(
+            "Use a Codex thread UUID, claude [session ID], or cursor [session ID]."
+        ) from None
+    wake_codex(ctx.obj, thread)
+
+
+def wake_codex(profile: Path, thread: UUID):
     binary = shutil.which("codex")
     if not binary:
         raise PigeonError("client_missing", "Install Codex and put it on your PATH.")
@@ -268,7 +308,7 @@ def wake(ctx: typer.Context, thread: UUID):
             "-m",
             "pigeon.cli",
             "--config",
-            str(ctx.obj),
+            str(profile),
             "mcp",
             "--codex-thread",
             str(thread),
@@ -577,6 +617,8 @@ def mcp_server(
     codex_thread: UUID | None = None,
     codex_bin: Path | None = None,
     codex_endpoint: str | None = None,
+    claude_channel: bool = False,
+    cursor_endpoint: str | None = None,
 ):
     """Run the local stdio MCP server."""
     from contextlib import ExitStack
@@ -585,8 +627,9 @@ def mcp_server(
 
     config = load(ctx.obj)
     wake_options = (codex_bin, codex_thread, codex_endpoint)
-    if any(wake_options) and (not all(wake_options) or session):
-        raise PigeonError("wake_config", "Use pigeon wake to launch automatic Codex delivery.")
+    targets = (any(wake_options), claude_channel, cursor_endpoint is not None)
+    if (any(wake_options) and not all(wake_options)) or sum(targets) + session > 1:
+        raise PigeonError("wake_config", "Use pigeon wake to launch automatic delivery.")
     with ExitStack() as stack:
         lock = None
         if session:
@@ -600,6 +643,8 @@ def mcp_server(
             codex_wake=(str(codex_bin), codex_thread, codex_endpoint)
             if codex_bin and codex_thread and codex_endpoint
             else None,
+            claude_channel=claude_channel,
+            cursor_endpoint=cursor_endpoint,
         ).run(transport="stdio")
 
 

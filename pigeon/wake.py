@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from uuid import UUID
 
@@ -41,7 +42,18 @@ async def queue_codex(binary: str, thread: UUID, endpoint: str):
             await proc.wait()
 
 
-async def listen(config: Config, binary: str, thread: UUID, endpoint: str, expires_at: float):
+async def notify_cursor(endpoint: str):
+    async with asyncio.timeout(5):
+        reader, writer = await asyncio.open_unix_connection(endpoint)
+        try:
+            if await reader.read(1) != b"1":
+                raise PigeonError("wake_failed", "Cursor rejected the wake request.")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+async def listen(config: Config, notify: Callable[[], Awaitable[None]], expires_at: float):
     notified = None
     delay = 1
     while time.time() < expires_at:
@@ -53,7 +65,7 @@ async def listen(config: Config, binary: str, thread: UUID, endpoint: str, expir
                         delay = 1
                         continue
                     if pending["message_id"] != notified:
-                        await queue_codex(binary, thread, endpoint)
+                        await notify()
                         notified = pending["message_id"]
                         delay = 1
                     # Wait for the chat to claim the message before checking again.

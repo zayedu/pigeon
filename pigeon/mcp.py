@@ -1,11 +1,15 @@
 import asyncio
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
-from typing import Annotated
+from functools import partial
+from typing import Annotated, Literal
 from uuid import UUID
 
+from mcp.server.fastmcp import Context as MCPContext
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.stdio import stdio_server
+from mcp.types import Notification
 from pydantic import Field
 
 from .client import ask_agent, open_client
@@ -25,7 +29,20 @@ from .models import (
     Take,
     Turn,
 )
-from .wake import listen
+from .wake import WAKE_PROMPT, listen, notify_cursor, queue_codex
+
+
+class ClaudeWakeNotification(Notification[dict, Literal["notifications/claude/channel"]]):
+    method: Literal["notifications/claude/channel"] = "notifications/claude/channel"
+
+
+class ClaudeChannel(FastMCP):
+    async def run_stdio_async(self) -> None:
+        async with stdio_server() as (reader, writer):
+            options = self._mcp_server.create_initialization_options(
+                experimental_capabilities={"claude/channel": {}}
+            )
+            await self._mcp_server.run(reader, writer, options)
 
 
 def create_mcp(
@@ -34,6 +51,8 @@ def create_mcp(
     allowed: Callable[[], frozenset[str]] | None = None,
     claim_session: Callable[[], None] | None = None,
     codex_wake: tuple[str, UUID, str] | None = None,
+    claude_channel: bool = False,
+    cursor_endpoint: str | None = None,
 ) -> FastMCP:
     listener: asyncio.Task | None = None
 
@@ -47,7 +66,8 @@ def create_mcp(
                 with suppress(asyncio.CancelledError):
                     await listener
 
-    server = FastMCP("Pigeon", lifespan=lifespan)
+    server_class = ClaudeChannel if claude_channel else FastMCP
+    server = server_class("Pigeon", lifespan=lifespan)
 
     @server.tool()
     async def pigeon_ask(to: Address, message: Content, context: Context | None = None) -> Turn:
@@ -107,7 +127,7 @@ def create_mcp(
         share_lock = asyncio.Lock()
 
         @server.tool()
-        async def pigeon_share() -> str:
+        async def pigeon_share(ctx: MCPContext) -> str:
             """Create a one-hour key when the user asks to share this session with a reviewer."""
             nonlocal shared, listener
             async with share_lock:
@@ -119,9 +139,19 @@ def create_mcp(
                     shared = Config(
                         relay=config.relay, agent=result["address"], token=result["token"]
                     )
+                    notify = None
                     if codex_wake is not None:
+                        notify = partial(queue_codex, *codex_wake)
+                    elif cursor_endpoint is not None:
+                        notify = partial(notify_cursor, cursor_endpoint)
+                    elif claude_channel:
+                        notify = partial(
+                            ctx.session.send_notification,
+                            ClaudeWakeNotification(params={"content": WAKE_PROMPT}),
+                        )
+                    if notify is not None:
                         listener = asyncio.create_task(
-                            listen(shared, *codex_wake, expires_at=result["expires_at"])
+                            listen(shared, notify, expires_at=result["expires_at"])
                         )
                     return result["key"]
                 except PigeonError as exc:
