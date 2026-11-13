@@ -360,8 +360,9 @@ def test_native_claude_wake_uses_the_sharing_sessions_inbox(relay, tmp_path, mon
         ):
             await owner.initialize()
             share = await owner.call_tool("pigeon_share", {})
+            assert "wake listener is attached" in share.content[1].text
             target = await reviewer.call(Redeem(key=share.structuredContent["result"]))
-            await reviewer.turn(
+            question = await reviewer.turn(
                 Submit(
                     to=target["address"],
                     conversation_id=uuid4(),
@@ -374,6 +375,12 @@ def test_native_claude_wake_uses_the_sharing_sessions_inbox(relay, tmp_path, mon
                 "type": "user",
                 "message": {"role": "user", "content": WAKE_PROMPT},
             }
+            reply = await owner.call_tool(
+                "pigeon_reply",
+                {"conversation_id": str(question.request.conversation_id), "message": "Bump"},
+            )
+            assert reply.isError
+            assert "The reviewer started this conversation" in reply.content[0].text
 
     with tempfile.TemporaryDirectory(dir="/tmp") as directory:
         asyncio.run(exchange(str(Path(directory) / "claude.sock")))

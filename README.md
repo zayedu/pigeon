@@ -63,6 +63,10 @@ through Claude's local inbox on macOS and Linux when cross-session messaging is
 available (Claude Code 2.1.224 or later). Claude's inbound message settings still
 apply. [Claude Code inbox docs](https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket)
 
+When you share a chat, Pigeon reports whether it attached a wake listener.
+If Claude can't wake, run `/status` in Claude and check that it shows a peer
+address. Check **Messages from your other sessions** in `/config` if a wake is held.
+
 For **Cursor CLI**, open the answering chat from its project directory:
 
 ```sh
@@ -83,4 +87,6 @@ In the reviewer's chat, ask the agent to call `pigeon_connect` with the key, the
 Pigeon prompts the answering chat automatically when wake is enabled.
 In other chats, say “Check Pigeon and reply.”
 
-Use `pigeon_reply` to ask a follow-up in the same conversation.
+The original caller can use `pigeon_reply` to ask a follow-up in the same
+conversation. To ask in the reverse direction, share the other agent's chat
+and start a conversation using its key.

@@ -9,7 +9,7 @@ from mcp.server.fastmcp import Context as MCPContext
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.stdio import stdio_server
-from mcp.types import Notification
+from mcp.types import CallToolResult, Notification, TextContent
 from pydantic import Field
 
 from .client import ask_agent, open_client
@@ -62,6 +62,7 @@ def create_mcp(
     cursor_endpoint: str | None = None,
 ) -> FastMCP:
     listener: asyncio.Task | None = None
+    shared: Config | None = None
 
     @asynccontextmanager
     async def lifespan(_server):
@@ -86,12 +87,23 @@ def create_mcp(
 
     @server.tool()
     async def pigeon_reply(conversation_id: UUID, message: Content) -> Turn:
-        """Ask a follow-up in a conversation whose previous turn completed."""
+        """Continue a conversation you started with pigeon_ask after it completed."""
         try:
             return await ask_agent(
                 config.relay, config.token, message, conversation_id=conversation_id
             )
         except PigeonError as exc:
+            if exc.code == "not_found" and shared is not None:
+                try:
+                    async with open_client(shared.relay, shared.token) as client:
+                        await client.turn(Inspect(conversation_id=conversation_id))
+                except PigeonError:
+                    pass
+                else:
+                    raise ToolError(
+                        "The reviewer started this conversation. They can send follow-ups "
+                        "with pigeon_reply. Use pigeon_answer for an incoming request."
+                    ) from None
             raise ToolError(str(exc)) from None
 
     @server.tool()
@@ -130,11 +142,10 @@ def create_mcp(
     if allowed is not None and claim_session is not None:
         register_session_tools(server, lambda: config, allowed, claim_session)
     else:
-        shared: Config | None = None
         share_lock = asyncio.Lock()
 
         @server.tool()
-        async def pigeon_share(ctx: MCPContext) -> str:
+        async def pigeon_share(ctx: MCPContext) -> Annotated[CallToolResult, str]:
             """Create a one-hour key when the user asks to share this session with a reviewer."""
             nonlocal shared, listener
             async with share_lock:
@@ -164,7 +175,18 @@ def create_mcp(
                         listener = asyncio.create_task(
                             listen(shared, notify, expires_at=result["expires_at"])
                         )
-                    return result["key"]
+                    wake_status = (
+                        "A wake listener is attached. The agent app's inbound settings still apply."
+                        if notify is not None
+                        else "Automatic wake is unavailable in this chat. Check Pigeon manually."
+                    )
+                    return CallToolResult(
+                        content=[
+                            TextContent(type="text", text=result["key"]),
+                            TextContent(type="text", text=wake_status),
+                        ],
+                        structuredContent={"result": result["key"]},
+                    )
                 except PigeonError as exc:
                     raise ToolError(str(exc)) from None
 
