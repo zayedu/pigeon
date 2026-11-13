@@ -290,11 +290,45 @@ def test_cursor_setup_preserves_existing_servers(relay, tmp_path):
     cursor.parent.mkdir()
     other = {"url": "https://example.test/mcp"}
     cursor.write_text(json.dumps({"mcpServers": {"other": other}}))
-    profile = tmp_path / "cursor.json"
-    env = os.environ | {"HOME": str(tmp_path)}
+    config_home = tmp_path / "config"
+    profile = config_home / "pigeon" / "config.json"
+    env = os.environ | {"HOME": str(tmp_path), "XDG_CONFIG_HOME": str(config_home)}
+    env.pop("PIGEON_CONFIG", None)
     args = ("setup", "cursor", "--username", "reviewer", "--relay", relay.url)
     for _ in range(2):
-        subprocess.run(cli(profile, *args), env=env, check=True, capture_output=True, timeout=10)
+        subprocess.run(
+            [sys.executable, "-m", "pigeon.cli", *args],
+            env=env,
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
     servers = json.loads(cursor.read_text())["mcpServers"]
     assert servers["other"] == other
     assert servers["pigeon-relay"]["args"][-3:] == ["--config", str(profile), "mcp"]
+
+
+def test_setup_reuses_legacy_hosted_profile(tmp_path):
+    import json
+
+    from pigeon.cli import HOSTED_RELAY
+    from pigeon.config import Config, save
+
+    config_home = tmp_path / "config"
+    profile = config_home / "pigeon" / "hosted-codex.json"
+    save(profile, Config(agent="@owner/codex", relay=HOSTED_RELAY, token="a" * 43))
+    env = os.environ | {"HOME": str(tmp_path), "XDG_CONFIG_HOME": str(config_home)}
+    env.pop("PIGEON_CONFIG", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "pigeon.cli", "setup", "cursor"],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    assert "Using @owner/codex." in result.stdout
+    assert not profile.with_name("config.json").exists()
+    settings = json.loads((tmp_path / ".cursor" / "mcp.json").read_text())
+    assert settings["mcpServers"]["pigeon-relay"]["args"][-3:] == ["--config", str(profile), "mcp"]

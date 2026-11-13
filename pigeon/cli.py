@@ -56,6 +56,7 @@ app.add_typer(relay_app, name="relay")
 
 Database = Annotated[Path, typer.Option("--db", help="Relay SQLite database.")]
 Wait = Annotated[int, typer.Option(min=0, max=60, help="Seconds to wait for a response.")]
+HOSTED_RELAY = "wss://pigeon-relay-rust.vercel.app"
 
 
 @app.callback()
@@ -65,6 +66,16 @@ def root(
 ):
     """Let your agent talk to mine."""
     ctx.obj = (config or default_config()).expanduser().absolute()
+    ctx.meta["explicit_config"] = config is not None
+
+
+def setup_profile(ctx: typer.Context, relay: str = HOSTED_RELAY) -> Path:
+    path = ctx.obj
+    if not ctx.meta["explicit_config"] and not path.exists() and relay == HOSTED_RELAY:
+        legacy = path.with_name("hosted-codex.json")
+        if legacy.is_file() and load(legacy).relay == HOSTED_RELAY:
+            return legacy
+    return path
 
 
 @relay_app.command("serve")
@@ -162,11 +173,12 @@ def setup(
     ctx: typer.Context,
     client: Literal["codex", "claude", "cursor"],
     username: str | None = None,
-    relay: str = "wss://pigeon-relay-rust.vercel.app",
+    relay: str = HOSTED_RELAY,
 ):
     """Create your Pigeon account and register it with your coding agent."""
     if client != "cursor" and not shutil.which(client):
         raise PigeonError("client_missing", f"Install {client} and put it on your PATH.")
+    ctx.obj = setup_profile(ctx, relay)
     with config_lock(ctx.obj):
         if not ctx.obj.exists():
             url = relay_endpoint(relay).removesuffix("/v1/ws")
@@ -195,6 +207,8 @@ def setup(
             config = Config(relay=url, **account)
             save(ctx.obj, config)
             typer.echo(f"Created {config.agent}.")
+        else:
+            typer.echo(f"Using {load(ctx.obj).agent}.")
     register_mcp(ctx.obj, client, "user", name="pigeon-relay")
 
 
@@ -226,6 +240,7 @@ def join(
 @app.command()
 def wake(ctx: typer.Context, thread: UUID):
     """Resume a Codex chat with automatic Pigeon notifications."""
+    ctx.obj = setup_profile(ctx)
     load(ctx.obj)
     binary = shutil.which("codex")
     if not binary:

@@ -27,7 +27,7 @@ Each person runs this once. The client is `codex`, `claude`, or `cursor`.
 pigeon setup codex
 ```
 
-Choose a username when asked.
+Choose a username when asked. Run the same setup command with another client to reuse your account there.
 
 ```text
 Created @<username>/agent.
