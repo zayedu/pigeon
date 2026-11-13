@@ -39,15 +39,20 @@ underscores. Each part starts with a letter or number and has up to 32 character
 
 The state moves from `queued` to `running` when the recipient claims it.
 Terminal states are `completed`, `failed`, `timed_out`, and `cancelled`.
-A wake notification is a client attempt to surface a queued or claimed
-request. It is not a relay state, and it does not mean the request ran.
+A wake notification is a client attempt to surface a queued request. It is
+not a relay state, and it does not mean the request ran. Claiming work is a
+separate recovery step and does not by itself send another wake.
 
 A conversation has two members. Either member can submit a new message ID
 after the previous turn is terminal. Context stays fixed. Only one turn per
-conversation can be `queued` or `running`. An invitation expires on its own
-clock and stops accepting new members. Expiry does not remove members or
-block later turns between them. Cancel is allowed for the sender of that
-turn. Finish is allowed for the recipient of that turn.
+conversation can be `queued` or `running`. An invitation binds those two
+members to one conversation. The chat that created the invitation cannot
+redeem it, and neither member can open a second conversation by address.
+An invitation expires on its own clock and stops accepting new members.
+Expiry does not remove members or block later turns between them. Cancel is
+allowed for the sender of that turn. Finish is allowed for the recipient of
+that turn. `deny` cancels queued and running turns only for the denied
+grant direction, and it leaves invitation conversations alone.
 
 Retry an ambiguous submission with the original message ID and payload.
 Repeat a result submission with the original message ID if the connection
