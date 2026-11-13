@@ -208,7 +208,8 @@ def setup(
             save(ctx.obj, config)
             typer.echo(f"Created {config.agent}.")
         else:
-            typer.echo(f"Using {load(ctx.obj).agent}.")
+            username = load(ctx.obj).agent.removeprefix("@").split("/", 1)[0]
+            typer.echo(f"Using your Pigeon account @{username}.")
     register_mcp(ctx.obj, client, "user", name="pigeon-relay")
 
 

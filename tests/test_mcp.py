@@ -328,7 +328,7 @@ def test_setup_reuses_legacy_hosted_profile(tmp_path):
         check=True,
         timeout=10,
     )
-    assert "Using @owner/codex." in result.stdout
+    assert "Using your Pigeon account @owner." in result.stdout
     assert not profile.with_name("config.json").exists()
     settings = json.loads((tmp_path / ".cursor" / "mcp.json").read_text())
     assert settings["mcpServers"]["pigeon-relay"]["args"][-3:] == ["--config", str(profile), "mcp"]
