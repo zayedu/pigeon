@@ -327,6 +327,58 @@ def test_native_codex_wake_requires_loaded_thread(tmp_path, monkeypatch):
     asyncio.run(check())
 
 
+def test_native_claude_wake_uses_the_sharing_sessions_inbox(relay, tmp_path, monkeypatch):
+    profile = tmp_path / "owner.json"
+    run_cli(profile, "login", relay.url, "--token-stdin", token=relay.alice)
+
+    async def exchange(socket):
+        received = asyncio.Queue()
+
+        async def inbox(reader, writer):
+            async for line in reader:
+                received.put_nowait(json.loads(line))
+            writer.close()
+            await writer.wait_closed()
+
+        monkeypatch.setenv("CLAUDE_CODE_MESSAGING_SOCKET", socket)
+        monkeypatch.setenv("CLAUDE_CODE_MESSAGING_TOKEN", "local-test-token")
+        executable, *args = cli(profile, "mcp")
+        params = StdioServerParameters(
+            command=executable,
+            args=args,
+            env={
+                key: os.environ[key]
+                for key in ("CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN")
+            },
+        )
+        async with (
+            asyncio.timeout(10),
+            await asyncio.start_unix_server(inbox, path=socket),
+            stdio_client(params) as streams,
+            ClientSession(*streams) as owner,
+            open_client(relay.url, relay.bob) as reviewer,
+        ):
+            await owner.initialize()
+            share = await owner.call_tool("pigeon_share", {})
+            target = await reviewer.call(Redeem(key=share.structuredContent["result"]))
+            await reviewer.turn(
+                Submit(
+                    to=target["address"],
+                    conversation_id=uuid4(),
+                    message_id=uuid4(),
+                    message="Reviewer content stays in the relay.",
+                )
+            )
+            assert await received.get() == {"type": "auth", "token": "local-test-token"}
+            assert await received.get() == {
+                "type": "user",
+                "message": {"role": "user", "content": WAKE_PROMPT},
+            }
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        asyncio.run(exchange(str(Path(directory) / "claude.sock")))
+
+
 def test_claude_channel_wakes_the_sharing_session(relay, tmp_path):
     profile = tmp_path / "owner.json"
     run_cli(profile, "login", relay.url, "--token-stdin", token=relay.alice)

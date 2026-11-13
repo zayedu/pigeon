@@ -119,6 +119,28 @@ async def notify_cursor(endpoint: str):
             await writer.wait_closed()
 
 
+def native_claude_wake() -> Callable[[], Awaitable[None]] | None:
+    endpoint = os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET")
+    if endpoint and Path(endpoint).is_socket():
+        return partial(notify_claude_inbox, endpoint, os.environ.get("CLAUDE_CODE_MESSAGING_TOKEN"))
+    return None
+
+
+async def notify_claude_inbox(endpoint: str, token: str | None):
+    async with asyncio.timeout(5):
+        _, writer = await asyncio.open_unix_connection(endpoint)
+        try:
+            if token:
+                writer.write(json.dumps({"type": "auth", "token": token}).encode() + b"\n")
+            # Claude's local inbox uses newline-delimited user message envelopes.
+            message = {"type": "user", "message": {"role": "user", "content": WAKE_PROMPT}}
+            writer.write(json.dumps(message).encode() + b"\n")
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
 async def listen(config: Config, notify: Callable[[], Awaitable[None]], expires_at: float):
     notified = None
     delay = 1

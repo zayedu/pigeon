@@ -58,18 +58,23 @@ If Codex opens read-only, exit the same chat in the other app or terminal and
 press `r` to retry. If Codex asks for a working directory, choose the session
 directory to continue in the original worktree.
 
-For **Cursor CLI** or **Claude Code**, open the answering chat from its project directory:
+For **Claude Code**, open `claude` normally and share the chat. Pigeon can wake it
+through Claude's local inbox on macOS and Linux when cross-session messaging is
+available (Claude Code 2.1.224 or later). Claude's inbound message settings still
+apply. [Claude Code inbox docs](https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket)
+
+For **Cursor CLI**, open the answering chat from its project directory:
 
 ```sh
 pigeon wake cursor
-pigeon wake claude
 ```
 
 Add a saved session ID after the client name to resume a conversation. Close the
 previous session before resuming it. Cursor runs in Pigeon's terminal through ACP.
-Claude Code opens its normal terminal and asks you to opt into the Pigeon
-development channel for that session. Your Anthropic account or organization
-must allow Channels. Share the chat after it opens and keep it running.
+Share the chat after it opens and keep it running.
+
+`pigeon wake claude` also supports Claude's development Channels preview. It
+opens the normal Claude terminal and asks you to enable the channel for that session.
 
 ## 4. Ask
 
