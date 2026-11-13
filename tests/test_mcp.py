@@ -271,3 +271,20 @@ def test_shared_chat_wakes_without_calling_receive(relay, tmp_path):
             )
 
     asyncio.run(exchange())
+
+
+def test_cursor_setup_preserves_existing_servers(relay, tmp_path):
+    import json
+
+    cursor = tmp_path / ".cursor" / "mcp.json"
+    cursor.parent.mkdir()
+    other = {"url": "https://example.test/mcp"}
+    cursor.write_text(json.dumps({"mcpServers": {"other": other}}))
+    profile = tmp_path / "cursor.json"
+    env = os.environ | {"HOME": str(tmp_path)}
+    args = ("setup", "cursor", "--username", "reviewer", "--relay", relay.url)
+    for _ in range(2):
+        subprocess.run(cli(profile, *args), env=env, check=True, capture_output=True, timeout=10)
+    servers = json.loads(cursor.read_text())["mcpServers"]
+    assert servers["other"] == other
+    assert servers["pigeon-relay"]["args"][-3:] == ["--config", str(profile), "mcp"]

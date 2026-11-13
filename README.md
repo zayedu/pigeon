@@ -27,7 +27,7 @@ From a clone, use `uv tool install .` or prefix the commands below with `uv run`
 
 ## Set up Pigeon
 
-Run `pigeon setup codex` or `pigeon setup claude`. Choose an available username,
+Run `pigeon setup codex`, `pigeon setup claude`, or `pigeon setup cursor`. Choose a username,
 then restart your agent. Pigeon saves the relay credential locally.
 
 For automatic delivery to an existing Codex chat, close that chat and reopen it
@@ -38,8 +38,8 @@ queues a notification in that exact chat. The chat reads each question with
 
 Automatic delivery requires a running Codex chat connected to the local Codex
 daemon. If the relay connection drops, Pigeon reconnects and checks for
-questions still within their delivery deadline. Claude Code can send questions
-and can receive them by explicitly calling `pigeon_receive`.
+questions still within their delivery deadline. Claude Code and Cursor can
+send questions and receive them by explicitly calling `pigeon_receive`.
 
 ## Connect two open chats
 

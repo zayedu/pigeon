@@ -7,6 +7,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 from contextlib import suppress
 from pathlib import Path
 from typing import Annotated, Literal
@@ -158,12 +159,12 @@ def connect_profile(path: Path, url: str, token: str, *, session_profile: bool =
 @app.command()
 def setup(
     ctx: typer.Context,
-    client: Literal["codex", "claude"],
+    client: Literal["codex", "claude", "cursor"],
     username: str | None = None,
     relay: str = "wss://pigeon-relay-rust.vercel.app",
 ):
     """Create your Pigeon account and register it with your coding agent."""
-    if not shutil.which(client):
+    if client != "cursor" and not shutil.which(client):
         raise PigeonError("client_missing", f"Install {client} and put it on your PATH.")
     with config_lock(ctx.obj):
         if not ctx.obj.exists():
@@ -542,7 +543,7 @@ def mcp_server(
 @app.command()
 def install(
     ctx: typer.Context,
-    host: Literal["claude", "codex"],
+    host: Literal["claude", "codex", "cursor"],
     scope: Literal["local", "user"] = "local",
 ):
     """Register Pigeon with Codex or Claude Code."""
@@ -551,10 +552,14 @@ def install(
 
 def register_mcp(path: Path, host: str, scope: str, *, name: str):
     load(path)
+    command = [sys.executable, "-m", "pigeon.cli", "--config", str(path), "mcp"]
+    if host == "cursor":
+        register_cursor(Path.home() / ".cursor" / "mcp.json", name, command)
+        typer.echo("Reload Cursor to load Pigeon.")
+        return
     binary = shutil.which(host)
     if not binary:
         raise PigeonError("client_missing", f"Install {host} and put it on your PATH.")
-    command = [sys.executable, "-m", "pigeon.cli", "--config", str(path), "mcp"]
     existing = subprocess.run(
         [binary, "mcp", "get", name], capture_output=True, text=True, check=False
     )
@@ -572,6 +577,31 @@ def register_mcp(path: Path, host: str, scope: str, *, name: str):
     if result.returncode:
         raise PigeonError("install_failed", f"{host} could not register the Pigeon MCP server.")
     typer.echo(f"Restart {host} to load {name}.")
+
+
+def register_cursor(path: Path, name: str, command: list[str]):
+    with config_lock(path):
+        try:
+            settings = json.loads(path.read_text()) if path.exists() else {}
+        except ValueError:
+            raise PigeonError("invalid_config", f"Fix the JSON in {path}, then retry.") from None
+        if not isinstance(settings, dict) or not isinstance(settings.get("mcpServers", {}), dict):
+            raise PigeonError("invalid_config", f"Fix the MCP server configuration in {path}.")
+        servers = settings.setdefault("mcpServers", {})
+        entry = {"command": command[0], "args": command[1:]}
+        if name in servers:
+            if servers[name] == entry:
+                return
+            raise PigeonError("already_installed", f"{name} is already registered in {path}.")
+        servers[name] = entry
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            try:
+                handle.write(json.dumps(settings, indent=2) + "\n")
+                handle.flush()
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
 
 
 def main():
