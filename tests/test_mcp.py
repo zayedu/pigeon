@@ -100,6 +100,7 @@ def test_cli_daemon_and_stdio_mcp(relay, tmp_path):
                 "pigeon_reply",
                 "pigeon_status",
                 "pigeon_cancel",
+                "pigeon_close",
                 "pigeon_connect",
                 "pigeon_share",
                 "pigeon_receive",
@@ -716,3 +717,84 @@ def test_two_chats_alternate_follow_ups_and_keep_separate_sessions(relay, tmp_pa
             assert str(conversation_id) in ids
 
     asyncio.run(run())
+
+
+def test_deny_describes_the_grant(relay, tmp_path):
+    profile = tmp_path / "alice.json"
+    run_cli(profile, "login", relay.url, "--token-stdin", token=relay.alice)
+    completed = subprocess.run(
+        cli(profile, "deny", BOB), text=True, capture_output=True, check=True, timeout=10
+    )
+    assert (
+        completed.stdout.strip() == f"Revoked the grant for {BOB}. Invitation sessions stay open."
+    )
+
+
+def test_two_chats_receive_without_blocking_each_other(relay):
+    import contextvars
+    from contextlib import asynccontextmanager
+
+    from mcp.server.fastmcp import FastMCP
+
+    import pigeon.mcp as mcp_module
+    from pigeon.config import Config
+    from pigeon.mcp import register_session_tools
+
+    async def exchange():
+        accounts = []
+        async with open_client(relay.url, relay.alice) as owner:
+            for index in range(2):
+                token = secrets.token_urlsafe(32)
+                shared = await owner.call(Share(session_id=uuid4(), session_token=token))
+                accounts.append((f"chat-{index}", token, shared))
+        async with open_client(relay.url, relay.bob) as joiner:
+            for _name, _token, shared in accounts:
+                joined = await joiner.call(Redeem(key=shared["key"]))
+                await joiner.turn(
+                    Submit(
+                        to=joined["address"],
+                        conversation_id=joined["conversation_id"],
+                        message_id=uuid4(),
+                        message="Waiting",
+                    )
+                )
+        configs = {
+            name: Config(relay=relay.url, token=token, agent=shared["address"])
+            for name, token, shared in accounts
+        }
+        chat = contextvars.ContextVar("chat")
+        server = FastMCP("pigeon-test")
+
+        async def restore(_ctx):
+            return configs[chat.get()]
+
+        register_session_tools(
+            server, lambda: None, restore=restore, chat_of=lambda _ctx: chat.get()
+        )
+        entered = []
+        release = asyncio.Event()
+        real_open = mcp_module.open_client
+
+        @asynccontextmanager
+        async def wrapped(url, token):
+            async with real_open(url, token) as client:
+                entered.append(token)
+                if len(entered) == 2:
+                    release.set()
+                else:
+                    await asyncio.wait_for(release.wait(), 2)
+                yield client
+
+        mcp_module.open_client = wrapped
+        try:
+
+            async def receive(name):
+                chat.set(name)
+                return await server._tool_manager.call_tool("pigeon_receive", {"wait": 0})
+
+            await asyncio.gather(receive("chat-0"), receive("chat-1"))
+        finally:
+            mcp_module.open_client = real_open
+        assert len(entered) == 2
+
+    asyncio.run(exchange())
