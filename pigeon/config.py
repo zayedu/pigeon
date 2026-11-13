@@ -1,14 +1,17 @@
+import hashlib
 import os
 import re
+import secrets
 import tempfile
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
-from .models import Address, PigeonError
+from .models import Address, PigeonError, Share
 
 
 def default_config() -> Path:
@@ -70,6 +73,27 @@ def validate_token(token: str):
 
 def state_path(path: Path) -> Path:
     return path.with_name(path.name + ".state")
+
+
+def chat_share(profile: Path | None, config: Config, chat_id: str | None) -> Share:
+    if profile is None or chat_id is None:
+        return Share(session_id=uuid4(), session_token=secrets.token_urlsafe(32))
+    identity = hashlib.sha256(f"{config.relay}\n{config.agent}\n{chat_id}".encode()).hexdigest()
+    path = state_path(profile) / "chats" / f"{identity}.json"
+    with config_lock(path):
+        if path.exists():
+            return Share.model_validate_json(path.read_bytes())
+        share = Share(session_id=uuid4(), session_token=secrets.token_urlsafe(32))
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            try:
+                handle.write(share.model_dump_json().encode())
+                handle.flush()
+                os.fsync(handle.fileno())
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return share
 
 
 @contextmanager

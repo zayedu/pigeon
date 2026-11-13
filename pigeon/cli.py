@@ -61,6 +61,20 @@ Wait = Annotated[int, typer.Option(min=0, max=60, help="Seconds to wait for a re
 HOSTED_RELAY = "wss://pigeon-relay-rust.vercel.app"
 
 
+@app.command()
+def update():
+    """Install the latest Pigeon and keep your account and chat state."""
+    uv = shutil.which("uv")
+    if uv is None:
+        raise PigeonError("uv_missing", "Install uv and put it on your PATH.")
+    result = subprocess.run(
+        [uv, "tool", "install", "--reinstall", "git+https://github.com/zayedu/pigeon.git"],
+    )
+    if result.returncode:
+        raise typer.Exit(result.returncode)
+    typer.echo("Reopen your agent to load the update.")
+
+
 @app.callback()
 def root(
     ctx: typer.Context,
@@ -657,6 +671,7 @@ def mcp_server(
             else None,
             claude_channel=claude_channel,
             cursor_endpoint=cursor_endpoint,
+            profile=ctx.obj,
         ).run(transport="stdio")
 
 

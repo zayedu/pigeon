@@ -213,6 +213,57 @@ def test_session_key_between_two_chats_with_the_same_profile(relay, tmp_path):
     asyncio.run(exchange())
 
 
+def test_chat_can_reinvite_and_answer_after_mcp_restart(relay, tmp_path):
+    profile = tmp_path / "owner.json"
+    run_cli(profile, "login", relay.url, "--token-stdin", token=relay.alice)
+    executable, *args = cli(profile, "mcp")
+    params = StdioServerParameters(
+        command=executable, args=args, env={"CLAUDE_CODE_SESSION_ID": str(uuid4())}
+    )
+
+    async def exchange():
+        async with asyncio.timeout(12), open_client(relay.url, relay.bob) as reviewer:
+            async with stdio_client(params) as streams, ClientSession(*streams) as owner:
+                await owner.initialize()
+                first = (await owner.call_tool("pigeon_share", {})).structuredContent["result"]
+                async with open_client(relay.url, relay.alice) as test_client:
+                    test_target = await test_client.call(Redeem(key=first))
+                second = (await owner.call_tool("pigeon_share", {})).structuredContent["result"]
+                assert second != first
+                target = await reviewer.call(Redeem(key=second))
+                assert target == test_target == await reviewer.call(Redeem(key=second))
+                question = await reviewer.turn(
+                    Submit(
+                        to=target["address"],
+                        conversation_id=uuid4(),
+                        message_id=uuid4(),
+                        message="Can you still answer after reconnecting?",
+                    )
+                )
+                claimed = await owner.call_tool("pigeon_receive", {"wait": 0})
+                assert claimed.structuredContent["result"]["status"] == "running"
+
+            async with stdio_client(params) as streams, ClientSession(*streams) as owner:
+                await owner.initialize()
+                restored = await owner.call_tool("pigeon_receive", {"wait": 0})
+                assert restored.structuredContent["result"]["request"]["id"] == str(
+                    question.request.id
+                )
+                answer = await owner.call_tool(
+                    "pigeon_answer",
+                    {
+                        "message_id": str(question.request.id),
+                        "message": "Yes.",
+                    },
+                )
+                assert not answer.isError
+                assert (
+                    await reviewer.turn(Inspect(conversation_id=question.request.conversation_id))
+                ).response.content == "Yes."
+
+    asyncio.run(exchange())
+
+
 def test_setup_creates_named_profile_without_invite(relay, tmp_path):
     from pigeon.config import load
 
@@ -371,16 +422,34 @@ def test_native_claude_wake_uses_the_sharing_sessions_inbox(relay, tmp_path, mon
                 )
             )
             assert await received.get() == {"type": "auth", "token": "local-test-token"}
-            assert await received.get() == {
-                "type": "user",
-                "message": {"role": "user", "content": WAKE_PROMPT},
-            }
+            event = await received.get()
+            assert event["type"] == event["message"]["role"] == "user"
+            assert event["message"]["content"].startswith(WAKE_PROMPT + "\n")
+            assert "Reviewer content" not in event["message"]["content"]
             reply = await owner.call_tool(
                 "pigeon_reply",
                 {"conversation_id": str(question.request.conversation_id), "message": "Bump"},
             )
             assert reply.isError
             assert "The reviewer started this conversation" in reply.content[0].text
+            await owner.call_tool("pigeon_receive", {"wait": 0})
+            answer = await owner.call_tool(
+                "pigeon_answer",
+                {"message_id": str(question.request.id), "message": "Received."},
+            )
+            assert not answer.isError
+            await reviewer.turn(
+                Submit(
+                    to=target["address"],
+                    conversation_id=question.request.conversation_id,
+                    message_id=uuid4(),
+                    message="A second question.",
+                )
+            )
+            assert (await received.get())["type"] == "auth"
+            follow_up = await received.get()
+            assert follow_up["message"]["content"].startswith(WAKE_PROMPT + "\n")
+            assert follow_up["message"]["content"] != event["message"]["content"]
 
     with tempfile.TemporaryDirectory(dir="/tmp") as directory:
         asyncio.run(exchange(str(Path(directory) / "claude.sock")))

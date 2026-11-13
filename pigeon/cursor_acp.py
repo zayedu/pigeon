@@ -194,6 +194,9 @@ async def run_cursor(binary: str, profile: Path, session_id: str | None):
                     "session/load" if session_id else "session/new", params
                 )
                 client.session_id = session_id or result["sessionId"]
+                Path(endpoint).with_suffix(".session").write_text(
+                    client.session_id, encoding="utf-8"
+                )
                 print(
                     f"Cursor session {client.session_id}. Type /exit to leave.\n> ",
                     end="",

@@ -33,6 +33,19 @@ CREATE TABLE IF NOT EXISTS session_shares (
     reviewer TEXT REFERENCES agents
 );
 CREATE INDEX IF NOT EXISTS shares_by_owner ON session_shares(owner, expires_at);
+CREATE TABLE IF NOT EXISTS shared_chats (
+    owner TEXT NOT NULL REFERENCES agents,
+    id TEXT NOT NULL,
+    recipient TEXT NOT NULL UNIQUE REFERENCES session_shares,
+    PRIMARY KEY (owner, id)
+);
+CREATE TABLE IF NOT EXISTS chat_invites (
+    key_hash TEXT PRIMARY KEY,
+    recipient TEXT NOT NULL REFERENCES session_shares,
+    expires_at REAL NOT NULL,
+    reviewer TEXT REFERENCES agents
+);
+CREATE INDEX IF NOT EXISTS chat_invites_by_recipient ON chat_invites(recipient, expires_at);
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     sender TEXT REFERENCES agents NOT NULL,
@@ -208,39 +221,109 @@ class Store:
                     (sender, recipient),
                 )
 
-    def share(self, owner: str) -> dict:
+    def share(self, owner: str, session_id=None, session_token=None, resume=False) -> dict:
+        if bool(session_id) != bool(session_token) or (resume and not session_id):
+            raise PigeonError("invalid_share", "Provide both session ID and session credential.")
         now = time.time()
         name = f"{owner.split('/')[0]}/pr-{secrets.token_hex(8)}"
         key = "pg_" + secrets.token_urlsafe(16)
-        token = secrets.token_urlsafe(32)
+        token = session_token or secrets.token_urlsafe(32)
+        expires = now + 3600
         with self.transaction() as db:
             if db.execute("SELECT 1 FROM session_shares WHERE recipient=?", (owner,)).fetchone():
                 raise PigeonError("invalid_share", "Share from your main Pigeon identity.")
-            count = db.execute(
-                "SELECT count(*) AS total FROM session_shares WHERE owner=? AND expires_at>?",
-                (owner, now),
-            ).fetchone()["total"]
-            if count >= 10:
-                raise PigeonError("share_limit", "You already have ten active session keys.")
-            db.execute("INSERT INTO agents VALUES (?, ?)", (name, token_hash(token)))
-            db.execute(
-                "INSERT INTO session_shares VALUES (?, ?, ?, ?, NULL)",
-                (name, owner, token_hash(key), now + 3600),
+            existing = (
+                db.execute(
+                    """SELECT c.recipient, a.token_hash FROM shared_chats c
+                   JOIN agents a ON a.address=c.recipient WHERE c.owner=? AND c.id=?""",
+                    (owner, str(session_id)),
+                ).fetchone()
+                if session_id
+                else None
             )
-        return {"address": name, "key": key, "token": token, "expires_at": now + 3600}
+            if existing:
+                if existing["token_hash"] != token_hash(token):
+                    raise PigeonError("forbidden", "This chat belongs to a different installation.")
+                name = existing["recipient"]
+                if resume:
+                    expires = db.execute(
+                        "SELECT expires_at FROM session_shares WHERE recipient=?", (name,)
+                    ).fetchone()["expires_at"]
+                    return {"address": name, "token": token, "expires_at": expires}
+                db.execute(
+                    "UPDATE session_shares SET expires_at=? WHERE recipient=?", (expires, name)
+                )
+            else:
+                if resume:
+                    raise PigeonError("not_found", "This chat has no shared Pigeon inbox yet.")
+                count = db.execute(
+                    "SELECT count(*) AS total FROM session_shares WHERE owner=? AND expires_at>?",
+                    (owner, now),
+                ).fetchone()["total"]
+                if count >= 10:
+                    raise PigeonError("share_limit", "You already have ten active shared chats.")
+                db.execute("INSERT INTO agents VALUES (?, ?)", (name, token_hash(token)))
+                db.execute(
+                    "INSERT INTO session_shares VALUES (?, ?, ?, ?, NULL)",
+                    (
+                        name,
+                        owner,
+                        token_hash(key if not session_id else secrets.token_urlsafe(32)),
+                        expires,
+                    ),
+                )
+                if session_id:
+                    db.execute(
+                        "INSERT INTO shared_chats VALUES (?, ?, ?)", (owner, str(session_id), name)
+                    )
+            if session_id:
+                db.execute(
+                    "DELETE FROM chat_invites WHERE recipient=? AND expires_at<=?", (name, now)
+                )
+                count = db.execute(
+                    "SELECT count(*) AS total FROM chat_invites "
+                    "WHERE recipient=? AND reviewer IS NULL",
+                    (name,),
+                ).fetchone()["total"]
+                if count >= 10:
+                    # Retire the oldest unused invitation. Redeemed invitations keep working.
+                    db.execute(
+                        """DELETE FROM chat_invites WHERE key_hash IN (
+                           SELECT key_hash FROM chat_invites WHERE recipient=? AND reviewer IS NULL
+                           ORDER BY expires_at LIMIT 1)""",
+                        (name,),
+                    )
+                db.execute(
+                    "INSERT INTO chat_invites VALUES (?, ?, ?, NULL)",
+                    (token_hash(key), name, expires),
+                )
+        return {"address": name, "key": key, "token": token, "expires_at": expires}
 
     def redeem(self, reviewer: str, key: str) -> dict:
         with self.transaction() as db:
-            share = db.execute(
-                "SELECT * FROM session_shares WHERE key_hash=? AND expires_at>?",
+            invite = db.execute(
+                "SELECT * FROM chat_invites WHERE key_hash=? AND expires_at>?",
                 (token_hash(key), time.time()),
             ).fetchone()
+            share = (
+                invite
+                or db.execute(
+                    "SELECT * FROM session_shares WHERE key_hash=? AND expires_at>?",
+                    (token_hash(key), time.time()),
+                ).fetchone()
+            )
             if not share or share["reviewer"] not in (None, reviewer):
                 raise PigeonError("invalid_key", "This session key is invalid, expired, or in use.")
-            db.execute(
-                "UPDATE session_shares SET reviewer=? WHERE recipient=?",
-                (reviewer, share["recipient"]),
-            )
+            if invite:
+                db.execute(
+                    "UPDATE chat_invites SET reviewer=? WHERE key_hash=?",
+                    (reviewer, token_hash(key)),
+                )
+            else:
+                db.execute(
+                    "UPDATE session_shares SET reviewer=? WHERE recipient=?",
+                    (reviewer, share["recipient"]),
+                )
             db.execute("INSERT OR IGNORE INTO grants VALUES (?, ?)", (share["recipient"], reviewer))
         return {"address": share["recipient"]}
 
@@ -291,7 +374,9 @@ class Store:
                    WHERE g.sender=? AND g.recipient=? AND a.token_hash IS NOT NULL
                    AND NOT EXISTS (
                        SELECT 1 FROM session_shares s WHERE s.recipient=g.recipient
-                       AND (s.expires_at<=? OR s.reviewer IS NOT g.sender)
+                       AND (s.expires_at<=? OR (s.reviewer IS NOT g.sender AND NOT EXISTS (
+                           SELECT 1 FROM shared_chats c WHERE c.recipient=s.recipient
+                       )))
                    )""",
                 (sender, request.to, now),
             ).fetchone():
@@ -382,9 +467,12 @@ class Store:
         with self.transaction(write=False) as db:
             row = db.execute(
                 TURN
-                + """ WHERE c.recipient=? AND t.status='queued' AND t.deadline>?
-                    ORDER BY t.rowid LIMIT 1""",
-                (recipient, time.time()),
+                + """ WHERE c.recipient=? AND t.deadline>? AND (t.status='queued' OR (
+                        t.status='running' AND EXISTS (
+                            SELECT 1 FROM shared_chats c WHERE c.recipient=?
+                        )))
+                    ORDER BY (t.status='running') DESC, t.rowid LIMIT 1""",
+                (recipient, time.time(), recipient),
             ).fetchone()
         return {"message_id": row["id"], "deadline": row["deadline"]} if row else None
 
@@ -392,9 +480,12 @@ class Store:
         with self.transaction() as db:
             row = db.execute(
                 TURN
-                + """ WHERE c.recipient=? AND t.status='queued' AND t.deadline>?
-                    ORDER BY t.rowid LIMIT 1""",
-                (recipient, time.time()),
+                + """ WHERE c.recipient=? AND t.deadline>? AND (t.status='queued' OR (
+                        t.status='running' AND EXISTS (
+                            SELECT 1 FROM shared_chats c WHERE c.recipient=?
+                        )))
+                    ORDER BY (t.status='running') DESC, t.rowid LIMIT 1""",
+                (recipient, time.time(), recipient),
             ).fetchone()
             if not row:
                 return None

@@ -94,6 +94,9 @@ class Signup(Frame):
 
 class Share(Frame):
     op: Literal["share"] = "share"
+    session_id: UUID4 | None = None
+    session_token: Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{43}$")] | None = None
+    resume: bool = False
 
 
 ShareKey = Annotated[str, Field(pattern=r"^pg_[A-Za-z0-9_-]{22}$")]

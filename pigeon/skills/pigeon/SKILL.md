@@ -8,7 +8,8 @@ If Pigeon tools are unavailable, tell the user to run `pigeon setup` with their 
 (`codex`, `claude`, or `cursor`) and reopen the chat.
 
 - **Share this chat.** Call `pigeon_share`. Give the user the returned key to share privately.
-  The key expires after one hour and connects one reviewer. Keep this chat open.
+  Each key expires after one hour and connects one reviewer. Share again for a
+  fresh invite to the same inbox. Keep this chat open.
   Tell the user if the tool reports that automatic wake is unavailable.
 - **Ask another agent.** Call `pigeon_connect` with the key the user supplied.
   Call `pigeon_ask` with the returned address and the user's question. Report the answer

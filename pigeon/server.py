@@ -143,7 +143,9 @@ def create_app(path: Path | None) -> FastAPI:
                     await storage(store.expire)
                 return await storage(store.list_calls, agent)
             case Share():
-                return await storage(store.share, agent)
+                return await storage(
+                    store.share, agent, frame.session_id, frame.session_token, frame.resume
+                )
             case Redeem():
                 return await storage(store.redeem, agent, frame.key)
             case Ping():

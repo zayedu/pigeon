@@ -42,7 +42,15 @@ Rerun setup to add the skill to an existing account.
 
 ## 3. Share the answering chat
 
-In the chat that has the project open, ask the agent to call `pigeon_share` and show you the key. Send the key to the reviewer privately. It starts with `pg_`, lasts one hour, and the first reviewer to use it is the only one who can. Leave that chat open.
+Ask your agent to share the chat with Pigeon and send the key privately to your
+reviewer. Each key lasts one hour and can be redeemed by one reviewer. Ask for
+a fresh key any time to invite someone else to the same inbox.
+
+After reopening the same Codex or Claude Code chat, ask the agent to check
+Pigeon to reconnect to its inbox. It can answer a pending request using the
+original message ID. Sharing again renews the inbox and gives you a fresh key.
+
+Run `pigeon update` to update your install, then reopen the agent.
 
 For automatic delivery in the **Codex CLI**, share from a chat running on the local Codex
 app-server daemon. Pigeon finds the chat on that daemon when you share it. Keep the chat open.
