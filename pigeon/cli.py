@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Annotated, Literal
@@ -229,21 +230,49 @@ def wake(ctx: typer.Context, thread: UUID):
     binary = shutil.which("codex")
     if not binary:
         raise PigeonError("client_missing", "Install Codex and put it on your PATH.")
-    args = [
-        "-m",
-        "pigeon.cli",
-        "--config",
-        str(ctx.obj),
-        "mcp",
-        "--codex-thread",
-        str(thread),
-        "--codex-bin",
-        str(Path(binary).resolve()),
-    ]
-    server = (
-        f"mcp_servers.pigeon-relay={{command={json.dumps(sys.executable)},args={json.dumps(args)}}}"
-    )
-    raise typer.Exit(subprocess.call([binary, "-c", server, "resume", str(thread)]))
+    # Unix socket paths are limited to about 100 bytes on macOS.
+    with tempfile.TemporaryDirectory(prefix="pigeon-", dir="/tmp") as directory:
+        socket = Path(directory) / "codex.sock"
+        endpoint = f"unix://{socket}"
+        args = [
+            "-m",
+            "pigeon.cli",
+            "--config",
+            str(ctx.obj),
+            "mcp",
+            "--codex-thread",
+            str(thread),
+            "--codex-bin",
+            str(Path(binary).resolve()),
+            "--codex-endpoint",
+            endpoint,
+        ]
+        mcp_config = (
+            f"mcp_servers.pigeon-relay={{command={json.dumps(sys.executable)},"
+            f"args={json.dumps(args)}}}"
+        )
+        with subprocess.Popen(
+            [binary, "-c", mcp_config, "app-server", "--listen", endpoint],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            start_new_session=True,
+        ) as server:
+            try:
+                deadline = time.monotonic() + 10
+                while not socket.exists():
+                    if server.poll() is not None or time.monotonic() >= deadline:
+                        raise PigeonError("wake_failed", "Could not start the Codex app server.")
+                    time.sleep(0.05)
+                raise typer.Exit(
+                    subprocess.call([binary, "resume", "--remote", endpoint, str(thread)])
+                )
+            finally:
+                with suppress(ProcessLookupError):
+                    server.terminate()
+                try:
+                    server.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    server.kill()
 
 
 @app.command("session")
@@ -517,6 +546,7 @@ def mcp_server(
     session: bool = False,
     codex_thread: UUID | None = None,
     codex_bin: Path | None = None,
+    codex_endpoint: str | None = None,
 ):
     """Run the local stdio MCP server."""
     from contextlib import ExitStack
@@ -524,7 +554,8 @@ def mcp_server(
     from .mcp import create_mcp
 
     config = load(ctx.obj)
-    if bool(codex_thread) != bool(codex_bin) or (session and codex_thread):
+    wake_options = (codex_bin, codex_thread, codex_endpoint)
+    if any(wake_options) and (not all(wake_options) or session):
         raise PigeonError("wake_config", "Use pigeon wake to launch automatic Codex delivery.")
     with ExitStack() as stack:
         lock = None
@@ -536,7 +567,9 @@ def mcp_server(
             config,
             allowed=local_allowlist(ctx.obj, config) if session else None,
             claim_session=(lambda: stack.enter_context(local_lock(lock))) if lock else None,
-            codex_wake=(str(codex_bin), codex_thread) if codex_thread else None,
+            codex_wake=(str(codex_bin), codex_thread, codex_endpoint)
+            if codex_bin and codex_thread and codex_endpoint
+            else None,
         ).run(transport="stdio")
 
 
@@ -546,7 +579,7 @@ def install(
     host: Literal["claude", "codex", "cursor"],
     scope: Literal["local", "user"] = "local",
 ):
-    """Register Pigeon with Codex or Claude Code."""
+    """Register Pigeon with Codex, Claude Code, or Cursor."""
     register_mcp(ctx.obj, host, scope, name="pigeon")
 
 

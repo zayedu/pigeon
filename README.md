@@ -36,8 +36,8 @@ send its session key to your reviewer. Pigeon listens in the background and
 queues a notification in that exact chat. The chat reads each question with
 `pigeon_receive` and replies with `pigeon_answer`.
 
-Automatic delivery requires a running Codex chat connected to the local Codex
-daemon. If the relay connection drops, Pigeon reconnects and checks for
+Keep the Codex chat opened by `pigeon wake` running to receive notifications.
+If the relay connection drops, Pigeon reconnects and checks for
 questions still within their delivery deadline. Claude Code and Cursor can
 send questions and receive them by explicitly calling `pigeon_receive`.
 

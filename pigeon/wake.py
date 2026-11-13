@@ -16,10 +16,12 @@ WAKE_PROMPT = (
 )
 
 
-async def queue_codex(binary: str, thread: UUID):
+async def queue_codex(binary: str, thread: UUID, endpoint: str):
     proc = await asyncio.create_subprocess_exec(
         binary,
         "queue",
+        "--remote",
+        endpoint,
         "--thread",
         str(thread),
         "--message",
@@ -39,7 +41,7 @@ async def queue_codex(binary: str, thread: UUID):
             await proc.wait()
 
 
-async def listen(config: Config, binary: str, thread: UUID, expires_at: float):
+async def listen(config: Config, binary: str, thread: UUID, endpoint: str, expires_at: float):
     notified = None
     delay = 1
     while time.time() < expires_at:
@@ -51,7 +53,7 @@ async def listen(config: Config, binary: str, thread: UUID, expires_at: float):
                         delay = 1
                         continue
                     if pending["message_id"] != notified:
-                        await queue_codex(binary, thread)
+                        await queue_codex(binary, thread, endpoint)
                         notified = pending["message_id"]
                         delay = 1
                     # Wait for the chat to claim the message before checking again.

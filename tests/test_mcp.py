@@ -237,7 +237,17 @@ def test_shared_chat_wakes_without_calling_receive(relay, tmp_path):
     binary.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" >> "{wake_log}"\n')
     binary.chmod(0o700)
     thread = str(uuid4())
-    executable, *args = cli(profile, "mcp", "--codex-thread", thread, "--codex-bin", str(binary))
+    endpoint = f"unix://{tmp_path / 'codex.sock'}"
+    executable, *args = cli(
+        profile,
+        "mcp",
+        "--codex-thread",
+        thread,
+        "--codex-bin",
+        str(binary),
+        "--codex-endpoint",
+        endpoint,
+    )
 
     async def exchange():
         async with (
@@ -257,11 +267,11 @@ def test_shared_chat_wakes_without_calling_receive(relay, tmp_path):
                     message="Why is this private detail here?",
                 )
             )
-            while not wake_log.exists():
+            while not wake_log.exists() or len(wake_log.read_text().splitlines()) < 7:
                 await asyncio.sleep(0.05)
             wake_args = wake_log.read_text().splitlines()
-            assert wake_args[:4] == ["queue", "--thread", thread, "--message"]
-            assert question.request.content not in wake_args[4]
+            assert wake_args[:6] == ["queue", "--remote", endpoint, "--thread", thread, "--message"]
+            assert question.request.content not in wake_args[6]
             assert (
                 await reviewer.turn(Inspect(conversation_id=question.request.conversation_id))
             ).status == "queued"

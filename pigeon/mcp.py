@@ -33,7 +33,7 @@ def create_mcp(
     *,
     allowed: Callable[[], frozenset[str]] | None = None,
     claim_session: Callable[[], None] | None = None,
-    codex_wake: tuple[str, UUID] | None = None,
+    codex_wake: tuple[str, UUID, str] | None = None,
 ) -> FastMCP:
     listener: asyncio.Task | None = None
 
