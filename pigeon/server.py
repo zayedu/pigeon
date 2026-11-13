@@ -16,6 +16,7 @@ from .models import (
     ACTIVE,
     MAX_FRAME,
     Cancel,
+    Close,
     Command,
     Finish,
     Grant,
@@ -134,6 +135,8 @@ def create_app(path: Path | None) -> FastAPI:
                 result = await storage(store.submit, agent, frame)
             case Cancel():
                 result = await storage(store.inspect, agent, frame)
+            case Close():
+                result = await storage(store.close, agent, str(frame.conversation_id))
             case Finish():
                 result = await storage(store.finish, agent, frame)
             case Grant():
@@ -147,7 +150,7 @@ def create_app(path: Path | None) -> FastAPI:
                     store.share, agent, frame.session_id, frame.session_token, frame.resume
                 )
             case Redeem():
-                return await storage(store.redeem, agent, frame.key)
+                return await storage(store.redeem, agent, frame.key, frame.peer_session)
             case Ping():
                 return {"agent": agent, "protocol": 1}
         notify()

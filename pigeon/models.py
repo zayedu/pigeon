@@ -75,6 +75,11 @@ class Cancel(Frame):
     message_id: UUID4
 
 
+class Close(Frame):
+    op: Literal["close"] = "close"
+    conversation_id: UUID4
+
+
 class ListCalls(Frame):
     op: Literal["list"] = "list"
 
@@ -105,10 +110,22 @@ ShareKey = Annotated[str, Field(pattern=r"^pg_[A-Za-z0-9_-]{22}$")]
 class Redeem(Frame):
     op: Literal["redeem"] = "redeem"
     key: ShareKey
+    peer_session: bool = False
 
 
 Command = (
-    Submit | Inspect | Take | Finish | Cancel | ListCalls | Ping | Grant | Share | Redeem | Watch
+    Submit
+    | Inspect
+    | Take
+    | Finish
+    | Cancel
+    | Close
+    | ListCalls
+    | Ping
+    | Grant
+    | Share
+    | Redeem
+    | Watch
 )
 command = TypeAdapter(Annotated[Command, Field(discriminator="op")])
 

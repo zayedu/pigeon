@@ -17,6 +17,7 @@ from .models import (
     Context,
     Inspect,
     PigeonError,
+    Ping,
     Submit,
     Turn,
 )
@@ -149,8 +150,12 @@ async def ask_agent(
         try:
             async with open_client(relay, token) as client:
                 if to is None:
+                    me = (await client.call(Ping()))["agent"]
                     previous = await client.turn(Inspect(conversation_id=conversation_id))
-                    to = previous.request.recipient
+                    parties = {previous.request.sender, previous.request.recipient}
+                    if me not in parties:
+                        raise PigeonError("not_found", "Conversation or message not found.")
+                    to = (parties - {me}).pop()
                 submitted = True
                 return await client.ask(
                     to,

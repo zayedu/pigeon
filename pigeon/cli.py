@@ -40,6 +40,7 @@ from .daemon import Daemon, Echo, Sessions
 from .db import open_store
 from .models import (
     Cancel,
+    Close,
     Command,
     Context,
     Grant,
@@ -380,7 +381,7 @@ def open_session(
     """Open the session picker or resume by ID with the Pigeon inbox."""
     config = load(ctx.obj)
     if not config.allowed:
-        raise PigeonError("peer_required", "Allow a reviewer before opening the session inbox.")
+        raise PigeonError("peer_required", "Allow a peer before opening the session inbox.")
     binary = shutil.which(client)
     if not binary:
         raise PigeonError("client_missing", f"Install {client} and put it on your PATH.")
@@ -472,9 +473,9 @@ def allow(ctx: typer.Context, sender: str):
 
 @app.command()
 def deny(ctx: typer.Context, sender: str):
-    """Revoke a peer's access and cancel their active turns."""
+    """Revoke a peer's relay grant. Invitation sessions stay open."""
     set_permission(ctx.obj, sender, False)
-    typer.echo(f"Revoked access for {sender}.")
+    typer.echo(f"Revoked the grant for {sender}. Invitation sessions stay open.")
 
 
 daemon_app = typer.Typer(no_args_is_help=True, help="Run or inspect the local receiver.")
@@ -610,6 +611,13 @@ def cancel(ctx: typer.Context, conversation_id: UUID, message_id: UUID):
             rpc(load(ctx.obj), Cancel(conversation_id=conversation_id, message_id=message_id))
         )
     )
+
+
+@app.command()
+def close(ctx: typer.Context, conversation_id: UUID):
+    """Close one invitation session. Its history stays readable."""
+    show(asyncio.run(rpc(load(ctx.obj), Close(conversation_id=conversation_id))))
+    typer.echo(f"Closed session {conversation_id}. Other sessions stay open.")
 
 
 @app.command()

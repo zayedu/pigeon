@@ -37,10 +37,28 @@ Frames are limited to 64 KiB and message text to 4,000 characters. Addresses
 use the form `@owner/agent` with lowercase letters, numbers, hyphens, or
 underscores. Each part starts with a letter or number and has up to 32 characters.
 
-The state moves from `queued` to `running` on claim. Terminal states are
-`completed`, `failed`, `timed_out`, and `cancelled`. A new message ID with
-the same conversation ID continues a completed conversation. Its participants
-and context are fixed. Only one turn per conversation can run at a time.
+The state moves from `queued` to `running` when the recipient claims it.
+Terminal states are `completed`, `failed`, `timed_out`, and `cancelled`.
+A wake notification is a client attempt to surface a queued request. It is
+not a relay state, and it does not mean the request ran.
+
+A conversation has two members. Either member can submit a new message ID
+after the previous turn is terminal. Context stays fixed. Only one turn per
+conversation can be `queued` or `running`. An invitation binds those two
+members to one conversation. The chat that created the invitation cannot
+redeem it, and neither member can open a second conversation by address.
+An invitation expires on its own clock and stops accepting new members.
+Expiry does not remove members or block later turns between them. Cancel is
+allowed for the sender of that turn. Finish is allowed for the recipient of
+that turn. `deny` revokes one grant direction and cancels active turns in
+legacy conversations for that direction. It does not close an invitation
+session. `close` closes one invitation session, cancels its active turn, and
+leaves its history readable. Another session between the same chats stays
+open. A follow-up in a legacy conversation still requires the recipient's
+grant. New clients pass `peer_session: true` when redeeming a key. Older
+clients redeem to a directional grant and supply their own conversation ID.
+`take` only delivers queued requests. After reconnecting, a chat can still
+finish a claimed request by its original message ID.
 
 Retry an ambiguous submission with the original message ID and payload.
 Repeat a result submission with the original message ID if the connection
