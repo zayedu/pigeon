@@ -3,6 +3,8 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 from stat import S_IMODE
 from uuid import uuid4
 
@@ -10,10 +12,11 @@ import pytest
 from conftest import ALICE, BOB
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from websockets.asyncio.server import unix_serve
 
 from pigeon.client import open_client
 from pigeon.models import Inspect, PigeonError, Redeem, Submit, Turn
-from pigeon.wake import WAKE_PROMPT
+from pigeon.wake import WAKE_PROMPT, native_codex_wake
 
 
 def cli(config, *args):
@@ -288,6 +291,40 @@ def test_shared_chat_wakes_without_calling_receive(relay, tmp_path):
             )
 
     asyncio.run(exchange())
+
+
+def test_native_codex_wake_requires_loaded_thread(tmp_path, monkeypatch):
+    home = tmp_path / "codex"
+    socket = home / "app-server-control" / "app-server-control.sock"
+    socket.parent.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    binary = tmp_path / "codex-cli"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o700)
+    monkeypatch.setattr("pigeon.wake.shutil.which", lambda _: str(binary))
+    thread = str(uuid4())
+
+    async def app_server(connection):
+        request = json.loads(await connection.recv())
+        assert request["method"] == "initialize"
+        await connection.send(json.dumps({"id": request["id"], "result": {}}))
+        assert json.loads(await connection.recv())["method"] == "initialized"
+        request = json.loads(await connection.recv())
+        assert request["method"] == "thread/loaded/list"
+        await connection.send(json.dumps({"id": request["id"], "result": {"data": [thread]}}))
+
+    async def check():
+        # Use a short alias for macOS Unix socket path limits.
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            endpoint = Path(directory) / "codex.sock"
+            socket.symlink_to(endpoint)
+            async with unix_serve(app_server, str(endpoint)):
+                assert await native_codex_wake({"thread_id": str(uuid4())}) is None
+                wake = await native_codex_wake({"thread_id": thread})
+                assert wake is not None
+                await wake()
+
+    asyncio.run(check())
 
 
 def test_claude_channel_wakes_the_sharing_session(relay, tmp_path):

@@ -29,7 +29,7 @@ from .models import (
     Take,
     Turn,
 )
-from .wake import WAKE_PROMPT, listen, notify_cursor, queue_codex
+from .wake import WAKE_PROMPT, listen, native_codex_wake, notify_cursor, queue_codex
 
 
 class ClaudeWakeNotification(Notification[dict, Literal["notifications/claude/channel"]]):
@@ -148,6 +148,10 @@ def create_mcp(
                         notify = partial(
                             ctx.session.send_notification,
                             ClaudeWakeNotification(params={"content": WAKE_PROMPT}),
+                        )
+                    elif (meta := ctx.request_context.meta) is not None:
+                        notify = await native_codex_wake(
+                            meta.model_dump().get("x-codex-turn-metadata")
                         )
                     if notify is not None:
                         listener = asyncio.create_task(

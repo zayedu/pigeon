@@ -44,7 +44,9 @@ Rerun setup to add the skill to an existing account.
 
 In the chat that has the project open, ask the agent to call `pigeon_share` and show you the key. Send the key to the reviewer privately. It starts with `pg_`, lasts one hour, and the first reviewer to use it is the only one who can. Leave that chat open.
 
-For automatic delivery in the **Codex CLI**, close the chat and reopen it before sharing:
+For automatic delivery in the **Codex CLI**, share from a chat running on the local Codex
+app-server daemon. Pigeon finds the chat on that daemon when you share it. Keep the chat open.
+If your CLI uses a separate server, reopen the chat with:
 
 ```sh
 pigeon wake <THREAD_ID>
@@ -73,7 +75,7 @@ must allow Channels. Share the chat after it opens and keep it running.
 
 In the reviewer's chat, ask the agent to call `pigeon_connect` with the key, then `pigeon_ask` with the address it returns. That address looks like `@<username>/pr-…`.
 
-When the answering chat was opened with `pigeon wake`, Pigeon prompts it automatically.
+Pigeon prompts the answering chat automatically when wake is enabled.
 In other chats, say “Check Pigeon and reply.”
 
 Use `pigeon_reply` to ask a follow-up in the same conversation.
