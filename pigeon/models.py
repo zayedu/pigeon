@@ -115,6 +115,7 @@ ShareKey = Annotated[str, Field(pattern=r"^pg_[A-Za-z0-9_-]{22}$")]
 class Redeem(Frame):
     op: Literal["redeem"] = "redeem"
     key: ShareKey
+    peer_session: bool = False
 
 
 Command = (

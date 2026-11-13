@@ -184,8 +184,8 @@ def test_session_key_between_two_chats_with_the_same_profile(relay, tmp_path):
             key = (await owner.call_tool("pigeon_share", {})).structuredContent["result"]
             async with open_client(relay.url, relay.alice) as owner_account:
                 with pytest.raises(PigeonError, match="other chat"):
-                    await owner_account.call(Redeem(key=key))
-            destination = await reviewer.call(Redeem(key=key))
+                    await owner_account.call(Redeem(key=key, peer_session=True))
+            destination = await reviewer.call(Redeem(key=key, peer_session=True))
             question = asyncio.create_task(
                 reviewer.ask(
                     destination["address"],
@@ -222,11 +222,11 @@ def test_chat_can_reinvite_and_answer_after_mcp_restart(relay, tmp_path):
                 first = (await owner.call_tool("pigeon_share", {})).structuredContent["result"]
                 async with open_client(relay.url, relay.alice) as owner_account:
                     with pytest.raises(PigeonError, match="other chat"):
-                        await owner_account.call(Redeem(key=first))
+                        await owner_account.call(Redeem(key=first, peer_session=True))
                 second = (await owner.call_tool("pigeon_share", {})).structuredContent["result"]
                 assert second != first
-                target = await reviewer.call(Redeem(key=second))
-                assert target == await reviewer.call(Redeem(key=second))
+                target = await reviewer.call(Redeem(key=second, peer_session=True))
+                assert target == await reviewer.call(Redeem(key=second, peer_session=True))
                 question = await reviewer.turn(
                     Submit(
                         to=target["address"],
@@ -316,7 +316,9 @@ def test_shared_chat_wakes_without_calling_receive(relay, tmp_path):
         ):
             await owner.initialize()
             share = await owner.call_tool("pigeon_share", {})
-            target = await reviewer.call(Redeem(key=share.structuredContent["result"]))
+            target = await reviewer.call(
+                Redeem(key=share.structuredContent["result"], peer_session=True)
+            )
             question = await reviewer.turn(
                 Submit(
                     to=target["address"],
@@ -409,7 +411,9 @@ def test_native_claude_wake_uses_the_sharing_sessions_inbox(relay, tmp_path, mon
             await owner.initialize()
             share = await owner.call_tool("pigeon_share", {})
             assert "wake listener is attached" in share.content[1].text
-            target = await reviewer.call(Redeem(key=share.structuredContent["result"]))
+            target = await reviewer.call(
+                Redeem(key=share.structuredContent["result"], peer_session=True)
+            )
             question = await reviewer.turn(
                 Submit(
                     to=target["address"],
@@ -488,7 +492,7 @@ def test_claude_channel_wakes_the_sharing_session(relay, tmp_path):
                 await send({"id": 2, "method": "tools/call", "params": {"name": "pigeon_share"}})
                 share = json.loads(await proc.stdout.readline())
                 key = share["result"]["structuredContent"]["result"]
-                target = await reviewer.call(Redeem(key=key))
+                target = await reviewer.call(Redeem(key=key, peer_session=True))
                 question = await reviewer.turn(
                     Submit(
                         to=target["address"],
