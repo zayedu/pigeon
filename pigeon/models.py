@@ -75,6 +75,16 @@ class Cancel(Frame):
     message_id: UUID4
 
 
+class Close(Frame):
+    op: Literal["close"] = "close"
+    conversation_id: UUID4
+
+
+class Recover(Frame):
+    op: Literal["recover"] = "recover"
+    message_id: UUID4 | None = None
+
+
 class ListCalls(Frame):
     op: Literal["list"] = "list"
 
@@ -108,7 +118,19 @@ class Redeem(Frame):
 
 
 Command = (
-    Submit | Inspect | Take | Finish | Cancel | ListCalls | Ping | Grant | Share | Redeem | Watch
+    Submit
+    | Inspect
+    | Take
+    | Finish
+    | Cancel
+    | Close
+    | Recover
+    | ListCalls
+    | Ping
+    | Grant
+    | Share
+    | Redeem
+    | Watch
 )
 command = TypeAdapter(Annotated[Command, Field(discriminator="op")])
 

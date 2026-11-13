@@ -238,6 +238,8 @@ def test_chat_can_reinvite_and_answer_after_mcp_restart(relay, tmp_path):
                 claimed = await owner.call_tool("pigeon_receive", {"wait": 0})
                 assert claimed.structuredContent["result"]["status"] == "running"
 
+            with relay.store.transaction() as db:
+                db.execute("UPDATE turns SET claimed_at=0 WHERE status='running'")
             async with stdio_client(params) as streams, ClientSession(*streams) as owner:
                 await owner.initialize()
                 restored = await owner.call_tool("pigeon_receive", {"wait": 0})

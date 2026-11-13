@@ -51,8 +51,14 @@ redeem it, and neither member can open a second conversation by address.
 An invitation expires on its own clock and stops accepting new members.
 Expiry does not remove members or block later turns between them. Cancel is
 allowed for the sender of that turn. Finish is allowed for the recipient of
-that turn. `deny` cancels queued and running turns only for the denied
-grant direction, and it leaves invitation conversations alone.
+that turn. `deny` revokes one grant direction and cancels active turns in
+legacy conversations for that direction. It does not close an invitation
+session. `close` closes one invitation session, cancels its active turn, and
+leaves its history readable. Another session between the same chats stays
+open. A follow-up in a legacy conversation still requires the recipient's
+grant. `take` claims a queued request. `recover` returns a claimed shared-chat
+request only after its claim hold has lapsed, so a second live client does
+not receive it immediately.
 
 Retry an ambiguous submission with the original message ID and payload.
 Repeat a result submission with the original message ID if the connection
