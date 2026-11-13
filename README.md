@@ -52,6 +52,9 @@ pigeon wake <THREAD_ID>
 
 `<THREAD_ID>` is the UUID of that Codex thread. Ask the reopened chat to share.
 Keep the CLI chat running so Pigeon can prompt it when a question arrives.
+If Codex opens read-only, exit the same chat in the other app or terminal and
+press `r` to retry. If Codex asks for a working directory, choose the session
+directory to continue in the original worktree.
 
 For **Cursor CLI** or **Claude Code**, open the answering chat from its project directory:
 

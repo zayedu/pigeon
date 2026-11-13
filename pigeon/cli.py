@@ -293,13 +293,24 @@ def wake(
         raise typer.BadParameter(
             "Use a Codex thread UUID, claude [session ID], or cursor [session ID]."
         ) from None
-    wake_codex(ctx.obj, thread)
+    lock = default_config().expanduser().parent / "wake" / f"{thread}.lock"
+    lock.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with local_lock(lock, check_only=True) as already_open:
+        if already_open:
+            raise PigeonError(
+                "locked", "This chat is already open with pigeon wake. Use that terminal."
+            )
+        wake_codex(ctx.obj, thread)
 
 
 def wake_codex(profile: Path, thread: UUID):
     binary = shutil.which("codex")
     if not binary:
         raise PigeonError("client_missing", "Install Codex and put it on your PATH.")
+    typer.echo(
+        "If Codex opens read-only, exit the same chat in the other app or terminal "
+        "and press r here."
+    )
     # Unix socket paths are limited to about 100 bytes on macOS.
     with tempfile.TemporaryDirectory(prefix="pigeon-", dir="/tmp") as directory:
         socket = Path(directory) / "codex.sock"
@@ -343,6 +354,7 @@ def wake_codex(profile: Path, thread: UUID):
                     server.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     server.kill()
+                    server.wait()
 
 
 @app.command("session")
