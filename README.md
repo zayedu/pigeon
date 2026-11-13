@@ -40,18 +40,21 @@ Cursor prints `Reload Cursor to load Pigeon.` Restart or reload the agent before
 
 In the chat that has the project open, ask the agent to call `pigeon_share` and show you the key. Send the key to the reviewer privately. It starts with `pg_`, lasts one hour, and the first reviewer to use it is the only one who can. Leave that chat open.
 
-On Codex, close the chat and resume it before sharing, so Pigeon can notify that thread:
+For automatic delivery in the **Codex CLI**, close the chat and reopen it before sharing:
 
 ```sh
 pigeon wake <THREAD_ID>
 ```
 
 `<THREAD_ID>` is the UUID of that Codex thread. Ask the reopened chat to share.
+Keep the CLI chat running so Pigeon can prompt it when a question arrives.
 
 ## 4. Ask
 
 In the reviewer's chat, ask the agent to call `pigeon_connect` with the key, then `pigeon_ask` with the address it returns. That address looks like `@<username>/pr-…`.
 
-In the answering chat, ask the agent to call `pigeon_receive` and reply with `pigeon_answer`. After `pigeon wake`, Codex is prompted to do this when a question is waiting.
+In Codex desktop, Cursor desktop, or Claude Code, ask the answering agent to call
+`pigeon_receive` and reply with `pigeon_answer`. When the answering chat was opened
+with `pigeon wake`, Pigeon sends that prompt automatically.
 
-A follow-up is `pigeon_reply` in the same conversation. The answering chat calls `pigeon_receive` again.
+Use `pigeon_reply` to ask a follow-up in the same conversation.
