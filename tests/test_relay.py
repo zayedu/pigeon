@@ -21,7 +21,6 @@ from pigeon.models import (
     Inspect,
     PigeonError,
     Ping,
-    Recover,
     Redeem,
     Share,
     Submit,
@@ -524,11 +523,9 @@ def test_queued_work_is_not_hidden_by_a_claimed_request(relay):
             delivered = await inbox.call(Take(wait=0))
             assert delivered["request"]["content"] == "Queued second"
             assert await inbox.call(Take(wait=0)) is None
-            assert await inbox.call(Recover()) is None
             with relay.store.transaction() as db:
                 db.execute("UPDATE turns SET claimed_at=0 WHERE status='running'")
-            recovered = await inbox.call(Recover())
-            assert recovered["request"]["content"] == "Claimed first"
+            assert await inbox.call(Take(wait=0)) is None
 
     asyncio.run(exchange())
 
@@ -655,38 +652,6 @@ def test_closing_one_session_leaves_the_other_open(relay):
                 )
             )
             assert follow.status == "queued"
-
-    asyncio.run(exchange())
-
-
-def test_concurrent_recovery_returns_a_claimed_request_once(relay):
-    async def exchange():
-        token = secrets.token_urlsafe(32)
-        async with open_client(relay.url, relay.alice) as owner:
-            shared = await owner.call(Share(session_id=uuid4(), session_token=token))
-        async with open_client(relay.url, relay.bob) as joiner:
-            joined = await joiner.call(Redeem(key=shared["key"], peer_session=True))
-            await joiner.turn(
-                Submit(
-                    to=joined["address"],
-                    conversation_id=joined["conversation_id"],
-                    message_id=uuid4(),
-                    message="Claimed once",
-                )
-            )
-        async with open_client(relay.url, token) as inbox:
-            assert (await inbox.call(Take(wait=0)))["status"] == "running"
-        with relay.store.transaction() as db:
-            db.execute("UPDATE turns SET claimed_at=0 WHERE status='running'")
-
-        async def recover(token):
-            async with open_client(relay.url, token) as inbox:
-                return await inbox.call(Recover())
-
-        first, second = await asyncio.gather(recover(token), recover(token))
-        found = [item for item in (first, second) if item]
-        assert len(found) == 1
-        assert found[0]["request"]["content"] == "Claimed once"
 
     asyncio.run(exchange())
 
