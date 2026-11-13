@@ -2,292 +2,56 @@
 
 *Let your agent talk to mine.*
 
-Pigeon is a self-hosted relay for conversations between independently run coding
-agents. A reviewer can ask another developer’s agent why a pull request uses a
-particular cache strategy, then ask a follow-up in the same conversation.
+Ask a question in someone else's coding-agent chat and get the answer back in yours.
 
-```mermaid
-flowchart LR
-    Host["MCP host · @bob/claude"] <-->|stdio| Client["Pigeon MCP"]
-    Client <-->|"Outbound WebSocket"| Relay["Pigeon relay"]
-    Daemon["Pigeon daemon · @alice/codex"] <-->|"Outbound WebSocket"| Relay
-    Daemon <-->|"Dedicated local session"| Codex["Codex"]
-    Relay --- Store[("SQLite")]
-```
+## Before you start
 
-## Install
+- macOS or Linux
+- Python 3.12+: `python3 --version`
+- [uv](https://docs.astral.sh/uv/): `uv --version`
+- Codex, Claude Code, or Cursor, already signed in
 
-Requires macOS or Linux, Python 3.12+, and [uv](https://docs.astral.sh/uv/).
+## 1. Install Pigeon
 
 ```sh
 uv tool install git+https://github.com/zayedu/pigeon.git
 ```
 
-From a clone, use `uv tool install .` or prefix the commands below with `uv run`.
+If this fails, install [uv](https://docs.astral.sh/uv/getting-started/installation/) and run it again.
 
-## Set up Pigeon
+## 2. Create an account
 
-Run `pigeon setup codex`, `pigeon setup claude`, or `pigeon setup cursor`. Choose a username,
-then restart your agent. Pigeon saves the relay credential locally.
-
-For automatic delivery to an existing Codex chat, close that chat and reopen it
-with `pigeon wake THREAD_ID` from its repo. Then ask Codex to share the chat and
-send its session key to your reviewer. Pigeon listens in the background and
-queues a notification in that exact chat. The chat reads each question with
-`pigeon_receive` and replies with `pigeon_answer`.
-
-Keep the Codex chat opened by `pigeon wake` running to receive notifications.
-If the relay connection drops, Pigeon reconnects and checks for
-questions still within their delivery deadline. Claude Code and Cursor can
-send questions and receive them by explicitly calling `pigeon_receive`.
-
-## Connect two open chats
-
-Once Pigeon is configured in both agents, ask the implementing chat to use
-`pigeon_share` and give you its session key. Send that key to the reviewer
-privately. The reviewer tells their agent to use `pigeon_connect` with the key
-and ask their question with `pigeon_ask`.
-
-When the reviewer is ready, tell the implementing agent to use `pigeon_receive`
-and answer with `pigeon_answer`. The first reviewer to redeem a key gets access
-for one hour from when it was created. Two Codex chats can use the same Pigeon
-profile. Each keeps its own session inbox for the life of its MCP connection.
-
-## Join with an invite
-
-The relay operator runs `pigeon relay invite @bob/review wss://relay.example.com --db relay.sqlite3`
-and shares the printed invite privately. The invite is a credential.
-
-The reviewer runs this from their project, pastes the invite, and restarts Claude Code:
+Each person runs this once. The client is `codex`, `claude`, or `cursor`.
 
 ```sh
-pigeon join claude
+pigeon setup codex
 ```
 
-Use `pigeon join codex` for Codex. Once connected, ask your agent to use
-`pigeon_ask` with the recipient's address.
+Choose a username when asked.
 
-## Ask the session that implemented a PR
+```text
+Created @<username>/agent.
+Restart codex to load pigeon-relay.
+```
 
-Enroll a dedicated address such as `@alice/pr-1` and give its invite to the
-implementer. Alice closes the implementing session, then runs:
+Cursor prints `Reload Cursor to load Pigeon.` Restart or reload the agent before continuing. If Pigeon says the username is taken, run the command again with another name. If it says the client is missing, install that client and put it on your `PATH`.
+
+## 3. Share the answering chat
+
+In the chat that has the project open, ask the agent to call `pigeon_share` and show you the key. Send the key to the reviewer privately. It starts with `pg_`, lasts one hour, and the first reviewer to use it is the only one who can. Leave that chat open.
+
+On Codex, close the chat and resume it before sharing, so Pigeon can notify that thread:
 
 ```sh
-pigeon join codex --session
+pigeon wake <THREAD_ID>
 ```
 
-Paste the invite, enter the reviewer's address, and pick the original session.
-Use `claude` if Claude Code implemented the PR. In the reopened session, tell
-the agent to use `pigeon_receive`, answer from the PR context you approve,
-and send its reply with `pigeon_answer`. Bob's review session asks
-`@alice/pr-1` with `pigeon_ask`. Use `pigeon_receive` again for follow-ups.
+`<THREAD_ID>` is the UUID of that Codex thread. Ask the reopened chat to share.
 
-Each address has one listener. This workflow uses the existing session's
-context and permissions. The relay can queue a question until the session
-calls `pigeon_receive` or the request expires.
+## 4. Ask
 
-## Host the relay on Vercel
+In the reviewer's chat, ask the agent to call `pigeon_connect` with the key, then `pigeon_ask` with the address it returns. That address looks like `@<username>/pr-…`.
 
-Deploy this repository as a FastAPI project. Connect a Turso database to the
-deployment environment so Vercel provides `TURSO_DATABASE_URL` and
-`TURSO_AUTH_TOKEN`. Pigeon creates the schema on first use. All relay
-instances use the same database.
+In the answering chat, ask the agent to call `pigeon_receive` and reply with `pigeon_answer`. After `pigeon wake`, Codex is prompted to do this when a question is waiting.
 
-As the relay operator, pull the deployment's environment into a local file
-and use it to issue invites:
-
-```sh
-vercel env pull .env.pigeon-preview --environment preview
-uv run --env-file .env.pigeon-preview pigeon relay invite @bob/review wss://YOUR_DEPLOYMENT
-```
-
-Use the deployment's reachable hostname in the invite. Keep the environment
-file private. Anyone holding the database credential can administer the relay.
-
-## Host the relay on Fly.io
-
-From a clone, sign in with Fly's `flyctl` CLI and choose a unique app name.
-Use one Machine and one persistent volume in the same region.
-
-```sh
-flyctl apps create YOUR_APP
-flyctl volumes create pigeon_data --region yyz --size 1 --app YOUR_APP
-flyctl deploy --remote-only --ha=false --app YOUR_APP
-curl https://YOUR_APP.fly.dev/health
-```
-
-Create an invite on the hosted relay:
-
-```sh
-flyctl ssh console --app YOUR_APP -C 'pigeon relay invite @bob/review wss://YOUR_APP.fly.dev --db /data/relay.sqlite3'
-```
-
-Fly terminates TLS. The app stores relay state on the mounted volume. Run the
-daemon or the interactive session inbox on the machine with your coding agent.
-
-## Try it locally
-
-Open a terminal for the relay. Enroll both addresses and keep each printed token private.
-
-```sh
-pigeon relay enroll @alice/codex --db relay.sqlite3
-pigeon relay enroll @bob/claude --db relay.sqlite3
-pigeon relay serve --db relay.sqlite3
-```
-
-In a second terminal, paste Alice’s token at the prompt. The echo runtime gives
-you a working demo without model credentials.
-
-```sh
-export PIGEON_CONFIG="$HOME/.config/pigeon/demo-alice.json"
-pigeon login ws://127.0.0.1:8765
-pigeon expose --agent echo
-pigeon allow @bob/claude
-pigeon daemon run
-```
-
-In a third terminal, use Bob’s token.
-
-```sh
-export PIGEON_CONFIG="$HOME/.config/pigeon/demo-bob.json"
-pigeon login ws://127.0.0.1:8765
-pigeon send @alice/codex 'Why this cache strategy?' --pr 'alice/project#42'
-pigeon status
-```
-
-Copy the `request.conversation_id` from the response to continue.
-
-```sh
-pigeon reply CONVERSATION_ID 'How long do entries live?'
-```
-
-## Connect two machines
-
-Run one relay on a trusted host with a TLS certificate valid for its hostname.
-Give each developer their own token through a private channel. Each developer
-runs `pigeon login wss://relay.example.com:8765` on their machine. Clients
-verify the relay certificate using Python’s default trust store.
-
-```sh
-pigeon relay serve --db relay.sqlite3 --host 0.0.0.0 \
-  --cert /path/to/fullchain.pem --key /path/to/privkey.pem
-```
-
-On the receiving machine, install the native [Codex CLI](https://learn.chatgpt.com/docs/cli)
-0.167.2 or later and `curl`. Use `pigeon expose --codex /path/to/codex` if the
-native executable is outside your PATH. Stop the echo daemon if you used the local demo,
-then configure Codex with a directory containing only material you want this
-agent to inspect and discuss.
-
-```sh
-pigeon expose --agent codex --repo /path/to/approved-checkout
-# Run the dedicated Codex login command printed by expose.
-pigeon doctor
-pigeon allow @bob/claude
-pigeon daemon run
-```
-
-Use a normal user-owned directory for the workspace. Pigeon blocks system
-scratch directories from Codex’s shell. Use `--timeout` and `--concurrency`
-with `pigeon expose` to set local execution limits. Use one daemon per agent
-identity so follow-ups find the saved runtime session. The same `pigeon send`
-and `pigeon reply` commands from the local demo work with the real Codex daemon.
-
-On the calling machine, install [Claude Code](https://code.claude.com/docs/en/quickstart)
-and sign in with model access. Run this from the project where you use Claude.
-
-```sh
-pigeon install claude
-claude mcp get pigeon
-claude
-```
-
-Ask Claude to use `pigeon_ask` to contact `@alice/codex`. The MCP tools also
-support follow-ups, status, and cancellation. If a tool returns a queued or
-running turn, use `pigeon_status` with its conversation and request IDs.
-A GitHub PR reference supplies the owner, repository, and number as a hint.
-The runtime can use whatever relevant context is present in the approved checkout.
-
-### Let Codex initiate a conversation with Claude
-
-Claude Code can also receive requests in a dedicated text-only session. Use a
-current native Claude Code CLI with model access. On the Claude machine, use the
-Pigeon profile enrolled as the receiving identity (here, `@bob/claude`).
-
-```sh
-pigeon expose --agent claude
-# Run the dedicated Claude sign-in command printed by expose.
-pigeon allow @alice/codex
-pigeon daemon run
-```
-
-This runtime uses a dedicated Claude profile and has no workspace. Pigeon
-disables Claude's shell, file tools, and MCP tools for incoming turns. It rejects
-sessions that announce tools or MCP servers.
-
-On the Codex machine, register Pigeon with the active Codex CLI profile. Pass
-the absolute path to your Pigeon configuration if you use a custom profile.
-
-```sh
-codex mcp add pigeon -- "$(command -v pigeon)" mcp
-codex
-```
-
-Ask Codex to call Pigeon's `pigeon_ask` MCP tool with the Claude agent's address.
-Use `pigeon_reply` with the returned conversation ID for a follow-up.
-
-### Real-provider smoke test
-
-On the receiver, add a file named `PIGEON_SMOKE.txt` containing a distinctive
-test value in the approved workspace. Start the Codex daemon as above. On the
-caller, run this from a Pigeon clone with an authenticated Claude Code CLI.
-
-```sh
-uv run python tests/smoke_real.py --config "$PIGEON_CONFIG" \
-  --to @alice/codex --expect 'VALUE_FROM_PIGEON_SMOKE_TXT'
-```
-
-The script checks that Claude invokes both MCP tools and that Codex reads the
-file and remembers a value from the first turn. It can consume model usage.
-The CI suite uses the echo adapter and the official MCP SDK. The Codex adapter
-read a file and answered a follow-up on macOS through the official MCP client
-and a TLS relay. Claude Code’s MCP registration and connection were verified.
-The Claude model smoke test still requires a run with an account that has model
-access.
-
-## Delivery and trust
-
-- The relay stores conversations and message status in SQLite. Submitting the
-  same message ID and payload again returns the existing turn. A queued request
-  can wait for its recipient until its deadline. Once a worker claims it, the
-  relay never dispatches it again. If the worker disappears, the request can
-  expire with the execution outcome unknown.
-- A follow-up requires a completed turn and resumes a dedicated runtime session.
-  If the session is missing or cannot be resumed, start a new conversation.
-  Cancellation stops an active Codex process when the daemon learns of it.
-  Use `pigeon deny @bob/claude` to revoke a peer and cancel their active requests.
-  The relay operator can disable an agent credential with `pigeon relay revoke`.
-- The relay can read message contents and stores them in SQLite. Restrict access
-  to the database and share tokens privately. The daemon also checks its local
-  allowlist before invoking a runtime.
-- Codex runs with a dedicated home, a restricted filesystem profile, disabled
-  command networking, and no interactive approvals. The daemon checks the
-  sandbox before accepting work and exits if the checks fail. Codex can read
-  the approved workspace and platform runtime files. Keep secrets out of the
-  workspace. Peer prompts, inspected content, and responses may reach the
-  model provider or be retained in local Codex sessions.
-
-Use [the WebSocket protocol](PROTOCOL.md) to integrate without MCP.
-
-## Contribute
-
-```sh
-uv sync --locked
-uv run pytest -q
-uv run ruff check
-uv run ruff format --check
-```
-
-Use the echo runtime to reproduce relay or daemon issues. Include the command,
-expected outcome, and observed outcome in bug reports. Remove tokens and
-private message content from logs before sharing them.
+A follow-up is `pigeon_reply` in the same conversation. The answering chat calls `pigeon_receive` again.
