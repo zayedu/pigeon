@@ -206,3 +206,68 @@ def test_session_key_between_two_chats_with_the_same_profile(relay, tmp_path):
             )
 
     asyncio.run(exchange())
+
+
+def test_setup_creates_named_profile_without_invite(relay, tmp_path):
+    from pigeon.config import load
+
+    fake = tmp_path / "claude"
+    fake.write_text('#!/bin/sh\n[ "$2" = "add" ]\n')
+    fake.chmod(0o700)
+    env = os.environ | {"PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]}
+    profile = tmp_path / "william.json"
+    args = ("setup", "claude", "--username", "William", "--relay", relay.url)
+    subprocess.run(cli(profile, *args), env=env, check=True, capture_output=True, timeout=10)
+    config = load(profile)
+    assert config.agent == "@william/agent"
+    assert S_IMODE(profile.stat().st_mode) == 0o600
+    collision = subprocess.run(
+        cli(tmp_path / "other.json", *args), env=env, capture_output=True, text=True, timeout=10
+    )
+    assert collision.returncode == 1
+    assert "username is taken" in collision.stderr
+
+
+def test_shared_chat_wakes_without_calling_receive(relay, tmp_path):
+
+    profile = tmp_path / "owner.json"
+    run_cli(profile, "login", relay.url, "--token-stdin", token=relay.alice)
+    binary = tmp_path / "codex"
+    wake_log = tmp_path / "wake.log"
+    binary.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" >> "{wake_log}"\n')
+    binary.chmod(0o700)
+    thread = str(uuid4())
+    executable, *args = cli(profile, "mcp", "--codex-thread", thread, "--codex-bin", str(binary))
+
+    async def exchange():
+        async with (
+            asyncio.timeout(10),
+            stdio_client(StdioServerParameters(command=executable, args=args)) as streams,
+            ClientSession(*streams) as owner,
+            open_client(relay.url, relay.bob) as reviewer,
+        ):
+            await owner.initialize()
+            share = await owner.call_tool("pigeon_share", {})
+            target = await reviewer.call(Redeem(key=share.structuredContent["result"]))
+            question = await reviewer.turn(
+                Submit(
+                    to=target["address"],
+                    conversation_id=uuid4(),
+                    message_id=uuid4(),
+                    message="Why is this private detail here?",
+                )
+            )
+            while not wake_log.exists():
+                await asyncio.sleep(0.05)
+            wake_args = wake_log.read_text().splitlines()
+            assert wake_args[:4] == ["queue", "--thread", thread, "--message"]
+            assert question.request.content not in wake_args[4]
+            assert (
+                await reviewer.turn(Inspect(conversation_id=question.request.conversation_id))
+            ).status == "queued"
+            received = await owner.call_tool("pigeon_receive", {"wait": 0})
+            assert Turn.model_validate(received.structuredContent["result"]).request.id == (
+                question.request.id
+            )
+
+    asyncio.run(exchange())

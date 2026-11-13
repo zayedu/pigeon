@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Callable
+from contextlib import asynccontextmanager, suppress
 from typing import Annotated
 from uuid import UUID
 
@@ -24,6 +25,7 @@ from .models import (
     Take,
     Turn,
 )
+from .wake import listen
 
 
 def create_mcp(
@@ -31,8 +33,21 @@ def create_mcp(
     *,
     allowed: Callable[[], frozenset[str]] | None = None,
     claim_session: Callable[[], None] | None = None,
+    codex_wake: tuple[str, UUID] | None = None,
 ) -> FastMCP:
-    server = FastMCP("Pigeon")
+    listener: asyncio.Task | None = None
+
+    @asynccontextmanager
+    async def lifespan(_server):
+        try:
+            yield None
+        finally:
+            if listener is not None:
+                listener.cancel()
+                with suppress(asyncio.CancelledError):
+                    await listener
+
+    server = FastMCP("Pigeon", lifespan=lifespan)
 
     @server.tool()
     async def pigeon_ask(to: Address, message: Content, context: Context | None = None) -> Turn:
@@ -94,7 +109,7 @@ def create_mcp(
         @server.tool()
         async def pigeon_share() -> str:
             """Create a one-hour key when the user asks to share this session with a reviewer."""
-            nonlocal shared
+            nonlocal shared, listener
             async with share_lock:
                 if shared is not None:
                     raise ToolError("This session already has a share key.")
@@ -104,6 +119,10 @@ def create_mcp(
                     shared = Config(
                         relay=config.relay, agent=result["address"], token=result["token"]
                     )
+                    if codex_wake is not None:
+                        listener = asyncio.create_task(
+                            listen(shared, *codex_wake, expires_at=result["expires_at"])
+                        )
                     return result["key"]
                 except PigeonError as exc:
                     raise ToolError(str(exc)) from None

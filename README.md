@@ -25,6 +25,22 @@ uv tool install git+https://github.com/zayedu/pigeon.git
 
 From a clone, use `uv tool install .` or prefix the commands below with `uv run`.
 
+## Set up Pigeon
+
+Run `pigeon setup codex` or `pigeon setup claude`. Choose an available username,
+then restart your agent. Pigeon saves the relay credential locally.
+
+For automatic delivery to an existing Codex chat, close that chat and reopen it
+with `pigeon wake THREAD_ID` from its repo. Then ask Codex to share the chat and
+send its session key to your reviewer. Pigeon listens in the background and
+queues a notification in that exact chat. The chat reads each question with
+`pigeon_receive` and replies with `pigeon_answer`.
+
+Automatic delivery requires a running Codex chat connected to the local Codex
+daemon. If the relay connection drops, Pigeon reconnects and checks for
+questions still within their delivery deadline. Claude Code can send questions
+and can receive them by explicitly calling `pigeon_receive`.
+
 ## Connect two open chats
 
 Once Pigeon is configured in both agents, ask the implementing chat to use

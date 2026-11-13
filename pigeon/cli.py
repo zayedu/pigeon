@@ -10,7 +10,9 @@ import sys
 from contextlib import suppress
 from pathlib import Path
 from typing import Annotated, Literal
+from urllib.error import HTTPError, URLError
 from urllib.parse import urldefrag
+from urllib.request import Request, urlopen
 from uuid import UUID
 
 import typer
@@ -32,7 +34,18 @@ from .config import (
 )
 from .daemon import Daemon, Echo, Sessions
 from .db import open_store
-from .models import Cancel, Command, Context, Grant, Inspect, ListCalls, PigeonError, Ping, address
+from .models import (
+    Cancel,
+    Command,
+    Context,
+    Grant,
+    Inspect,
+    ListCalls,
+    PigeonError,
+    Ping,
+    Signup,
+    address,
+)
 from .server import serve
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
@@ -143,6 +156,47 @@ def connect_profile(path: Path, url: str, token: str, *, session_profile: bool =
 
 
 @app.command()
+def setup(
+    ctx: typer.Context,
+    client: Literal["codex", "claude"],
+    username: str | None = None,
+    relay: str = "wss://pigeon-relay-rust.vercel.app",
+):
+    """Create your Pigeon account and register it with your coding agent."""
+    if not shutil.which(client):
+        raise PigeonError("client_missing", f"Install {client} and put it on your PATH.")
+    with config_lock(ctx.obj):
+        if not ctx.obj.exists():
+            url = relay_endpoint(relay).removesuffix("/v1/ws")
+            payload = Signup(
+                username=(username or typer.prompt("Choose a username")).strip().lower()
+            )
+            endpoint = ("https" if url.startswith("wss:") else "http") + url[url.index(":") :]
+            request = Request(
+                endpoint + "/v1/signup",
+                data=payload.model_dump_json().encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urlopen(request, timeout=15) as response:
+                    account = json.load(response)
+            except HTTPError as exc:
+                if exc.code == 409:
+                    raise PigeonError(
+                        "username_taken", "That username is taken. Try another."
+                    ) from None
+                raise PigeonError(
+                    "signup_failed", f"Relay signup failed (HTTP {exc.code})."
+                ) from None
+            except (URLError, TimeoutError):
+                raise PigeonError("signup_failed", "Could not reach the signup endpoint.") from None
+            config = Config(relay=url, **account)
+            save(ctx.obj, config)
+            typer.echo(f"Created {config.agent}.")
+    register_mcp(ctx.obj, client, "user", name="pigeon-relay")
+
+
+@app.command()
 def join(
     ctx: typer.Context,
     client: Literal["claude", "codex"],
@@ -165,6 +219,30 @@ def join(
         open_session(ctx, client)
     else:
         register_mcp(ctx.obj, client, "local", name="pigeon-relay")
+
+
+@app.command()
+def wake(ctx: typer.Context, thread: UUID):
+    """Resume a Codex chat with automatic Pigeon notifications."""
+    load(ctx.obj)
+    binary = shutil.which("codex")
+    if not binary:
+        raise PigeonError("client_missing", "Install Codex and put it on your PATH.")
+    args = [
+        "-m",
+        "pigeon.cli",
+        "--config",
+        str(ctx.obj),
+        "mcp",
+        "--codex-thread",
+        str(thread),
+        "--codex-bin",
+        str(Path(binary).resolve()),
+    ]
+    server = (
+        f"mcp_servers.pigeon-relay={{command={json.dumps(sys.executable)},args={json.dumps(args)}}}"
+    )
+    raise typer.Exit(subprocess.call([binary, "-c", server, "resume", str(thread)]))
 
 
 @app.command("session")
@@ -433,13 +511,20 @@ def doctor(ctx: typer.Context):
 
 
 @app.command("mcp")
-def mcp_server(ctx: typer.Context, session: bool = False):
+def mcp_server(
+    ctx: typer.Context,
+    session: bool = False,
+    codex_thread: UUID | None = None,
+    codex_bin: Path | None = None,
+):
     """Run the local stdio MCP server."""
     from contextlib import ExitStack
 
     from .mcp import create_mcp
 
     config = load(ctx.obj)
+    if bool(codex_thread) != bool(codex_bin) or (session and codex_thread):
+        raise PigeonError("wake_config", "Use pigeon wake to launch automatic Codex delivery.")
     with ExitStack() as stack:
         lock = None
         if session:
@@ -450,6 +535,7 @@ def mcp_server(ctx: typer.Context, session: bool = False):
             config,
             allowed=local_allowlist(ctx.obj, config) if session else None,
             claim_session=(lambda: stack.enter_context(local_lock(lock))) if lock else None,
+            codex_wake=(str(codex_bin), codex_thread) if codex_thread else None,
         ).run(transport="stdio")
 
 

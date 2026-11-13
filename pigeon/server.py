@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sqlite3
 from collections import Counter
 from contextlib import asynccontextmanager, suppress
@@ -6,7 +7,7 @@ from pathlib import Path
 from time import monotonic
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
 from .client import is_loopback
@@ -24,8 +25,10 @@ from .models import (
     Ping,
     Redeem,
     Share,
+    Signup,
     Submit,
     Take,
+    Watch,
     command,
 )
 
@@ -71,6 +74,20 @@ def create_app(path: Path | None) -> FastAPI:
     async def health():
         return {"status": "ok", "protocol": 1}
 
+    @app.post("/v1/signup", status_code=201)
+    async def signup(request: Request, form: Signup):
+        source = request.client.host if request.client else "unknown"
+        if os.environ.get("VERCEL") == "1":
+            source = request.headers.get("x-vercel-forwarded-for", source)
+        try:
+            return await storage(store.signup, token_hash(source), form.username)
+        except PigeonError as exc:
+            raise HTTPException(
+                status_code=409 if exc.code == "username_taken" else 429, detail=str(exc)
+            ) from None
+        except sqlite3.OperationalError:
+            raise HTTPException(status_code=503, detail="Relay storage is busy.") from None
+
     def rate_limit(agent: str):
         now = monotonic()
         balance, last = buckets.get(agent, (40.0, now))
@@ -85,7 +102,7 @@ def create_app(path: Path | None) -> FastAPI:
         return operation(*args)
 
     async def dispatch(agent: str, digest: str, frame: Command):
-        if isinstance(frame, (Inspect, Take)):
+        if isinstance(frame, (Inspect, Take, Watch)):
             until = monotonic() + frame.wait
             while True:
                 if await storage(store.authenticate, digest) != agent:
@@ -98,9 +115,11 @@ def create_app(path: Path | None) -> FastAPI:
                     if result["status"] != frame.after or result["status"] not in ACTIVE:
                         return result
                 else:
-                    result = await storage(store.take, agent)
+                    operation = store.next_message if isinstance(frame, Watch) else store.take
+                    result = await storage(operation, agent)
                     if result:
-                        notify()
+                        if isinstance(frame, Take):
+                            notify()
                         return result
                 remaining = until - monotonic()
                 if remaining <= 0:

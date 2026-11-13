@@ -20,6 +20,11 @@ CREATE TABLE IF NOT EXISTS grants (
     sender TEXT REFERENCES agents NOT NULL,
     PRIMARY KEY (recipient, sender)
 );
+CREATE TABLE IF NOT EXISTS signup_limits (
+    source TEXT PRIMARY KEY,
+    day INTEGER NOT NULL,
+    count INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS session_shares (
     recipient TEXT PRIMARY KEY REFERENCES agents,
     owner TEXT NOT NULL REFERENCES agents,
@@ -142,6 +147,31 @@ class Store:
                     raise PigeonError("registered", "Agent already exists. Use --rotate.")
         return token
 
+    def signup(self, source: str, username: str) -> dict:
+        day = int(time.time() // 86400)
+        agent = f"@{username}/agent"
+        token = secrets.token_urlsafe(32)
+        with self.transaction() as db:
+            db.execute("DELETE FROM signup_limits WHERE day<?", (day,))
+            for bucket, limit in ((source, 20), ("all", 500)):
+                row = db.execute(
+                    "SELECT count FROM signup_limits WHERE source=?", (bucket,)
+                ).fetchone()
+                if row and row["count"] >= limit:
+                    raise PigeonError("rate_limited", "Signup limit reached. Try again tomorrow.")
+                db.execute(
+                    """INSERT INTO signup_limits VALUES (?, ?, 1)
+                       ON CONFLICT(source) DO UPDATE SET count=count+1""",
+                    (bucket, day),
+                )
+            if db.execute(
+                "SELECT 1 FROM agents WHERE address >= ? AND address < ? LIMIT 1",
+                (f"@{username}/", f"@{username}0"),
+            ).fetchone():
+                raise PigeonError("username_taken", "That username is already taken.")
+            db.execute("INSERT INTO agents VALUES (?, ?)", (agent, token_hash(token)))
+        return {"agent": agent, "token": token}
+
     def revoke(self, name: str):
         with self.transaction() as db:
             if not db.execute(
@@ -197,7 +227,7 @@ class Store:
                 "INSERT INTO session_shares VALUES (?, ?, ?, ?, NULL)",
                 (name, owner, token_hash(key), now + 3600),
             )
-        return {"address": name, "key": key, "token": token}
+        return {"address": name, "key": key, "token": token, "expires_at": now + 3600}
 
     def redeem(self, reviewer: str, key: str) -> dict:
         with self.transaction() as db:
@@ -347,6 +377,16 @@ class Store:
                 (agent, agent),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def next_message(self, recipient: str) -> dict | None:
+        with self.transaction(write=False) as db:
+            row = db.execute(
+                TURN
+                + """ WHERE c.recipient=? AND t.status='queued' AND t.deadline>?
+                    ORDER BY t.rowid LIMIT 1""",
+                (recipient, time.time()),
+            ).fetchone()
+        return {"message_id": row["id"], "deadline": row["deadline"]} if row else None
 
     def take(self, recipient: str) -> dict | None:
         with self.transaction() as db:

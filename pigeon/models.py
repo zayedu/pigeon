@@ -5,6 +5,8 @@ from pydantic import UUID4, BaseModel, ConfigDict, Field, TypeAdapter, field_val
 MAX_FRAME = 64 * 1024
 MAX_TEXT = 4_000
 MAX_WAIT = 20
+Username = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")]
+
 Address = Annotated[str, Field(pattern=r"^@[a-z0-9][a-z0-9_-]{0,31}/[a-z0-9][a-z0-9_-]{0,31}$")]
 address = TypeAdapter(Address)
 Content = Annotated[str, Field(min_length=1, max_length=MAX_TEXT)]
@@ -55,6 +57,11 @@ class Take(Frame):
     wait: Annotated[int, Field(strict=True, ge=0, le=MAX_WAIT)] = MAX_WAIT
 
 
+class Watch(Frame):
+    op: Literal["watch"] = "watch"
+    wait: Annotated[int, Field(strict=True, ge=0, le=MAX_WAIT)] = MAX_WAIT
+
+
 class Finish(Frame):
     op: Literal["finish"] = "finish"
     message_id: UUID4
@@ -81,6 +88,10 @@ class Grant(Frame):
     sender: Address
 
 
+class Signup(Frame):
+    username: Username
+
+
 class Share(Frame):
     op: Literal["share"] = "share"
 
@@ -93,7 +104,9 @@ class Redeem(Frame):
     key: ShareKey
 
 
-Command = Submit | Inspect | Take | Finish | Cancel | ListCalls | Ping | Grant | Share | Redeem
+Command = (
+    Submit | Inspect | Take | Finish | Cancel | ListCalls | Ping | Grant | Share | Redeem | Watch
+)
 command = TypeAdapter(Annotated[Command, Field(discriminator="op")])
 
 
