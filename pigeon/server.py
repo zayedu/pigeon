@@ -24,7 +24,6 @@ from .models import (
     ListCalls,
     PigeonError,
     Ping,
-    Recover,
     Redeem,
     Share,
     Signup,
@@ -138,9 +137,6 @@ def create_app(path: Path | None) -> FastAPI:
                 result = await storage(store.inspect, agent, frame)
             case Close():
                 result = await storage(store.close, agent, str(frame.conversation_id))
-            case Recover():
-                message_id = None if frame.message_id is None else str(frame.message_id)
-                return await storage(store.recover, agent, message_id)
             case Finish():
                 result = await storage(store.finish, agent, frame)
             case Grant():
@@ -154,7 +150,7 @@ def create_app(path: Path | None) -> FastAPI:
                     store.share, agent, frame.session_id, frame.session_token, frame.resume
                 )
             case Redeem():
-                return await storage(store.redeem, agent, frame.key)
+                return await storage(store.redeem, agent, frame.key, frame.peer_session)
             case Ping():
                 return {"agent": agent, "protocol": 1}
         notify()

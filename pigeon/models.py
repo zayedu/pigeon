@@ -80,11 +80,6 @@ class Close(Frame):
     conversation_id: UUID4
 
 
-class Recover(Frame):
-    op: Literal["recover"] = "recover"
-    message_id: UUID4 | None = None
-
-
 class ListCalls(Frame):
     op: Literal["list"] = "list"
 
@@ -115,6 +110,7 @@ ShareKey = Annotated[str, Field(pattern=r"^pg_[A-Za-z0-9_-]{22}$")]
 class Redeem(Frame):
     op: Literal["redeem"] = "redeem"
     key: ShareKey
+    peer_session: bool = False
 
 
 Command = (
@@ -124,7 +120,6 @@ Command = (
     | Finish
     | Cancel
     | Close
-    | Recover
     | ListCalls
     | Ping
     | Grant

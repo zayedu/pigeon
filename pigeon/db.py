@@ -86,8 +86,6 @@ MIGRATIONS = (
     "ALTER TABLE turns ADD COLUMN claim_token TEXT",
 )
 
-CLAIM_HOLD = 5
-
 TURN = """
 SELECT t.id, t.conversation_id, t.request, t.submitted_context, t.timeout, t.created_at,
        t.deadline, t.status, t.response_id, t.response, t.responded_at, t.detail,
@@ -347,7 +345,7 @@ class Store:
                 )
         return {"address": name, "key": key, "token": token, "expires_at": expires}
 
-    def redeem(self, reviewer: str, key: str) -> dict:
+    def redeem(self, reviewer: str, key: str, peer_session: bool = False) -> dict:
         digest = token_hash(key)
         now = time.time()
         with self.transaction() as db:
@@ -366,7 +364,7 @@ class Store:
             owner = db.execute(
                 "SELECT owner FROM session_shares WHERE recipient=?", (inbox,)
             ).fetchone()
-            if reviewer == inbox or (owner and reviewer == owner["owner"]):
+            if peer_session and (reviewer == inbox or (owner and reviewer == owner["owner"])):
                 raise PigeonError("invalid_key", "Open the other chat and join with this key.")
             if invite:
                 db.execute(
@@ -383,6 +381,9 @@ class Store:
                         "invalid_key", "This session key is invalid, expired, or in use."
                     )
                 conversation_id = current["conversation_id"]
+                if not peer_session and not conversation_id:
+                    db.execute("INSERT OR IGNORE INTO grants VALUES (?, ?)", (inbox, reviewer))
+                    return {"address": inbox}
                 if not conversation_id:
                     conversation_id = str(uuid4())
                     db.execute(
@@ -404,6 +405,7 @@ class Store:
                     "UPDATE session_shares SET reviewer=? WHERE recipient=?", (reviewer, inbox)
                 )
                 conversation_id = None
+                db.execute("INSERT OR IGNORE INTO grants VALUES (?, ?)", (inbox, reviewer))
         result = {"address": inbox}
         if conversation_id:
             result["conversation_id"] = conversation_id
@@ -496,11 +498,6 @@ class Store:
                     raise PigeonError(
                         "conflict", "Follow-ups require a completed turn. Check its status."
                     )
-            elif db.execute(
-                "SELECT 1 FROM shared_chats WHERE recipient=? OR recipient=?",
-                (sender, request.to),
-            ).fetchone():
-                raise PigeonError("forbidden", "Use the session created by the invitation.")
             elif not db.execute(
                 """SELECT 1 FROM grants g JOIN agents a ON a.address=g.recipient
                    WHERE g.sender=? AND g.recipient=? AND a.token_hash IS NOT NULL
@@ -577,7 +574,8 @@ class Store:
     def list_calls(self, agent: str) -> list[dict]:
         with self.transaction(write=False) as db:
             rows = db.execute(
-                """SELECT c.id AS conversation_id, c.sender, c.recipient, t.id AS message_id,
+                """SELECT c.id AS conversation_id, c.sender, c.recipient, c.closed,
+                          t.id AS message_id,
                           COALESCE(t.created_at, c.created_at) AS created_at, t.status
                    FROM conversations c LEFT JOIN turns t ON t.rowid=(
                        SELECT rowid FROM turns WHERE conversation_id=c.id
@@ -626,46 +624,6 @@ class Store:
                 (now, token, row["id"]),
             )
             if not updated.rowcount:
-                return None
-            return render_turn(db.execute(TURN + " WHERE t.id=?", (row["id"],)).fetchone())
-
-    def recover(self, recipient: str, message_id: str | None = None) -> dict | None:
-        now = time.time()
-        cutoff = now - CLAIM_HOLD
-        with self.transaction() as db:
-            query = (
-                TURN
-                + """ WHERE COALESCE(t.recipient, c.recipient)=? AND t.deadline>?
-                      AND t.status='running'
-                      AND EXISTS (SELECT 1 FROM shared_chats s WHERE s.recipient=?)
-                      AND (t.claimed_at IS NULL OR t.claimed_at<=?)"""
-            )
-            params: list = [recipient, now, recipient, cutoff]
-            if message_id is not None:
-                query += " AND t.id=?"
-                params.append(str(message_id))
-            query += " ORDER BY t.rowid LIMIT 1"
-            row = db.execute(query, params).fetchone()
-            if not row:
-                return None
-            token = secrets.token_hex(8)
-            match = "claim_token IS NULL" if row["claim_token"] is None else "claim_token=?"
-            params = [now, token, row["id"]]
-            if row["claim_token"] is not None:
-                params.append(row["claim_token"])
-            params.append(cutoff)
-            updated = db.execute(
-                f"""UPDATE turns SET claimed_at=?, claim_token=?
-                    WHERE id=? AND status='running' AND {match}
-                    AND (claimed_at IS NULL OR claimed_at<=?)""",
-                params,
-            )
-            if not updated.rowcount:
-                return None
-            current = db.execute(
-                "SELECT claim_token FROM turns WHERE id=?", (row["id"],)
-            ).fetchone()
-            if not current or current["claim_token"] != token:
                 return None
             return render_turn(db.execute(TURN + " WHERE t.id=?", (row["id"],)).fetchone())
 

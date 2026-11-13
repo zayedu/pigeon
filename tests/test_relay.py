@@ -21,7 +21,6 @@ from pigeon.models import (
     Inspect,
     PigeonError,
     Ping,
-    Recover,
     Redeem,
     Share,
     Submit,
@@ -228,13 +227,28 @@ def test_shared_store_preserves_transactions(monkeypatch, tmp_path):
     )
 
 
+def test_legacy_client_can_redeem_and_submit_with_its_own_id(relay):
+    async def exchange():
+        async with open_client(relay.url, relay.alice) as owner:
+            shared = await owner.call(
+                Share(session_id=uuid4(), session_token=secrets.token_urlsafe(32))
+            )
+        async with open_client(relay.url, relay.bob) as joiner:
+            joined = await joiner.call(Redeem(key=shared["key"]))
+            assert set(joined) == {"address"}
+            turn = await joiner.ask(joined["address"], "Old client", wait=0)
+            assert turn.status == "queued"
+
+    asyncio.run(exchange())
+
+
 def test_peers_alternate_after_the_invitation_expires(relay):
     async def exchange():
         token = secrets.token_urlsafe(32)
         async with open_client(relay.url, relay.alice) as owner:
             shared = await owner.call(Share(session_id=uuid4(), session_token=token))
         async with open_client(relay.url, relay.bob) as joiner:
-            joined = await joiner.call(Redeem(key=shared["key"]))
+            joined = await joiner.call(Redeem(key=shared["key"], peer_session=True))
             conversation_id = joined["conversation_id"]
             first = await joiner.turn(
                 Submit(
@@ -291,7 +305,7 @@ def test_peers_alternate_after_the_invitation_expires(relay):
             assert continued.request.sender == joined["address"]
         async with open_client(relay.url, relay.bob) as joiner:
             with pytest.raises(PigeonError) as exc:
-                await joiner.call(Redeem(key=shared["key"]))
+                await joiner.call(Redeem(key=shared["key"], peer_session=True))
             assert exc.value.code == "invalid_key"
             delivered = await joiner.call(Take(wait=0))
             assert delivered["request"]["content"] == "Membership outlives the key."
@@ -311,7 +325,7 @@ def test_one_invitation_accepts_one_joiner(relay):
         async def redeem(token):
             try:
                 async with open_client(relay.url, token) as client:
-                    return await client.call(Redeem(key=shared["key"]))
+                    return await client.call(Redeem(key=shared["key"], peer_session=True))
             except PigeonError as exc:
                 return exc
 
@@ -476,7 +490,7 @@ def test_queued_work_is_not_hidden_by_a_claimed_request(relay):
         async with open_client(relay.url, relay.alice) as owner:
             shared = await owner.call(Share(session_id=session_id, session_token=token))
         async with open_client(relay.url, relay.bob) as joiner:
-            joined = await joiner.call(Redeem(key=shared["key"]))
+            joined = await joiner.call(Redeem(key=shared["key"], peer_session=True))
             first = await joiner.turn(
                 Submit(
                     to=joined["address"],
@@ -494,7 +508,7 @@ def test_queued_work_is_not_hidden_by_a_claimed_request(relay):
                 "key"
             ]
         async with open_client(relay.url, relay.bob) as joiner:
-            other = await joiner.call(Redeem(key=second_key))
+            other = await joiner.call(Redeem(key=second_key, peer_session=True))
             await joiner.turn(
                 Submit(
                     to=other["address"],
@@ -509,11 +523,9 @@ def test_queued_work_is_not_hidden_by_a_claimed_request(relay):
             delivered = await inbox.call(Take(wait=0))
             assert delivered["request"]["content"] == "Queued second"
             assert await inbox.call(Take(wait=0)) is None
-            assert await inbox.call(Recover()) is None
             with relay.store.transaction() as db:
                 db.execute("UPDATE turns SET claimed_at=0 WHERE status='running'")
-            recovered = await inbox.call(Recover())
-            assert recovered["request"]["content"] == "Claimed first"
+            assert await inbox.call(Take(wait=0)) is None
 
     asyncio.run(exchange())
 
@@ -527,8 +539,8 @@ def test_revoking_a_grant_leaves_another_session_running(relay):
             second = await owner.call(Share(session_id=uuid4(), session_token=second_token))
             await owner.call(Grant(op="allow", sender=BOB))
         async with open_client(relay.url, relay.bob) as joiner:
-            one = await joiner.call(Redeem(key=first["key"]))
-            two = await joiner.call(Redeem(key=second["key"]))
+            one = await joiner.call(Redeem(key=first["key"], peer_session=True))
+            two = await joiner.call(Redeem(key=second["key"], peer_session=True))
             await joiner.turn(
                 Submit(
                     to=one["address"],
@@ -602,8 +614,8 @@ def test_closing_one_session_leaves_the_other_open(relay):
             first = await owner.call(Share(session_id=session_id, session_token=token))
             second = await owner.call(Share(session_id=session_id, session_token=token))
         async with open_client(relay.url, relay.bob) as joiner:
-            one = await joiner.call(Redeem(key=first["key"]))
-            two = await joiner.call(Redeem(key=second["key"]))
+            one = await joiner.call(Redeem(key=first["key"], peer_session=True))
+            two = await joiner.call(Redeem(key=second["key"], peer_session=True))
             await joiner.turn(
                 Submit(
                     to=one["address"],
@@ -644,45 +656,13 @@ def test_closing_one_session_leaves_the_other_open(relay):
     asyncio.run(exchange())
 
 
-def test_concurrent_recovery_returns_a_claimed_request_once(relay):
-    async def exchange():
-        token = secrets.token_urlsafe(32)
-        async with open_client(relay.url, relay.alice) as owner:
-            shared = await owner.call(Share(session_id=uuid4(), session_token=token))
-        async with open_client(relay.url, relay.bob) as joiner:
-            joined = await joiner.call(Redeem(key=shared["key"]))
-            await joiner.turn(
-                Submit(
-                    to=joined["address"],
-                    conversation_id=joined["conversation_id"],
-                    message_id=uuid4(),
-                    message="Claimed once",
-                )
-            )
-        async with open_client(relay.url, token) as inbox:
-            assert (await inbox.call(Take(wait=0)))["status"] == "running"
-        with relay.store.transaction() as db:
-            db.execute("UPDATE turns SET claimed_at=0 WHERE status='running'")
-
-        async def recover(token):
-            async with open_client(relay.url, token) as inbox:
-                return await inbox.call(Recover())
-
-        first, second = await asyncio.gather(recover(token), recover(token))
-        found = [item for item in (first, second) if item]
-        assert len(found) == 1
-        assert found[0]["request"]["content"] == "Claimed once"
-
-    asyncio.run(exchange())
-
-
 def test_concurrent_take_claims_one_queued_request(relay):
     async def exchange():
         token = secrets.token_urlsafe(32)
         async with open_client(relay.url, relay.alice) as owner:
             shared = await owner.call(Share(session_id=uuid4(), session_token=token))
         async with open_client(relay.url, relay.bob) as joiner:
-            joined = await joiner.call(Redeem(key=shared["key"]))
+            joined = await joiner.call(Redeem(key=shared["key"], peer_session=True))
             await joiner.turn(
                 Submit(
                     to=joined["address"],
