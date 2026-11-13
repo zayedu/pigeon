@@ -19,15 +19,18 @@ uv tool install git+https://github.com/zayedu/pigeon.git
 
 If this fails, install [uv](https://docs.astral.sh/uv/getting-started/installation/) and run it again.
 
-## 2. Create an account
+## 2. Set up your agent
 
-Each person runs this once. The client is `codex`, `claude`, or `cursor`.
+Each person runs this once for the agent they use. The client is `codex`,
+`claude`, or `cursor`.
 
 ```sh
 pigeon setup codex
 ```
 
-Choose a username when asked. Run the same setup command with another client to reuse your account there.
+Choose a distinct username when asked. There is no invite code and no relay
+server to run locally. If you use more than one client, run setup once for each
+client; you can keep the same account username where supported.
 
 ```text
 Created @<username>/agent.
@@ -36,25 +39,48 @@ Restart codex to load pigeon-relay.
 
 Cursor prints `Reload Cursor to load Pigeon.` Restart or reload the agent before continuing. If Pigeon says the username is taken, run the command again with another name. If it says the client is missing, install that client and put it on your `PATH`.
 
-Setup also installs the Pigeon skill. In your agent, say “Share this chat with Pigeon,”
-“Use this Pigeon key to ask why we chose this approach,” or “Check Pigeon and reply.”
-Rerun setup to add the skill to an existing account.
+Setup installs the Pigeon MCP connection and skill. Restart the agent after
+setup. From then on, use plain language:
+
+```text
+Share this chat with Pigeon.
+Use this Pigeon key to ask the reviewer to check the authentication changes.
+Check Pigeon and reply to the pending request.
+```
+
+Rerun setup if you add another client or need to repair its MCP configuration.
 
 ## 3. Share the answering chat
 
-Ask your agent to share the chat with Pigeon and send the key privately to your
-reviewer. Each key lasts one hour and can be redeemed by one reviewer. Ask for
-a fresh key any time to invite someone else to the same inbox.
+Ask the agent that should answer to share its current chat with Pigeon. It will
+return a short key. Send that key privately to the reviewer. Each key lasts one
+hour and can be redeemed once; ask the agent for a fresh key to invite another
+reviewer to the same chat.
 
-After reopening the same Codex or Claude Code chat, ask the agent to check
-Pigeon to reconnect to its inbox. It can answer a pending request using the
-original message ID. Sharing again renews the inbox and gives you a fresh key.
+The reviewer gives the key to their own agent in natural language. The reviewer
+does not need to know your username or run a relay command. The agent connects,
+asks its question, and Pigeon delivers it to the answering chat.
 
-Run `pigeon update` to update your install, then reopen the agent.
+If either agent was already open during setup, restart it. To update later:
 
-For automatic delivery in the **Codex CLI**, share from a chat running on the local Codex
-app-server daemon. Pigeon finds the chat on that daemon when you share it. Keep the chat open.
-If your CLI uses a separate server, reopen the chat with:
+```sh
+pigeon update
+```
+
+Then restart the agent again. This is the only maintenance command most users
+need.
+
+After reopening the same Codex or Claude Code chat, say “Check Pigeon” to
+reconnect to its inbox. It can answer a pending request using the original
+message ID. Sharing again renews the inbox and gives you a fresh key.
+
+### Automatic delivery and troubleshooting
+
+For automatic delivery in the **Codex CLI**, share from a chat running on the
+local Codex app-server daemon and keep that chat open. Pigeon attaches to it
+automatically. You normally do not need to run `pigeon wake`.
+
+If the CLI uses a separate server, reopen the chat explicitly with:
 
 ```sh
 pigeon wake <THREAD_ID>
@@ -66,10 +92,10 @@ If Codex opens read-only, exit the same chat in the other app or terminal and
 press `r` to retry. If Codex asks for a working directory, choose the session
 directory to continue in the original worktree.
 
-For **Claude Code**, open `claude` normally and share the chat. Pigeon can wake it
-through Claude's local inbox on macOS and Linux when cross-session messaging is
-available (Claude Code 2.1.224 or later). Claude's inbound message settings still
-apply. [Claude Code inbox docs](https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket)
+For **Claude Code**, open `claude` normally and share the chat. Pigeon uses
+Claude's local cross-session inbox to wake it; no `pigeon wake claude` command is
+needed in the normal flow. Claude's inbound message settings still apply.
+[Claude Code inbox docs](https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket)
 
 When you share a chat, Pigeon reports whether it attached a wake listener.
 If Claude can't wake, run `/status` in Claude and check that it shows a peer
@@ -85,8 +111,9 @@ Add a saved session ID after the client name to resume a conversation. Close the
 previous session before resuming it. Cursor runs in Pigeon's terminal through ACP.
 Share the chat after it opens and keep it running.
 
-`pigeon wake claude` also supports Claude's development Channels preview. It
-opens the normal Claude terminal and asks you to enable the channel for that session.
+Only use `pigeon wake claude` as a diagnostic fallback when the native inbox is
+not available. It uses Claude's development Channels preview and will ask you to
+enable that channel for the session.
 
 ## 4. Ask
 
