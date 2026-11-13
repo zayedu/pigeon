@@ -44,7 +44,7 @@ setup. From then on, use plain language:
 
 ```text
 Share this chat with Pigeon.
-Use this Pigeon key to ask the reviewer to check the authentication changes.
+Use this Pigeon key to ask the other chat to check the authentication changes.
 Check Pigeon and reply to the pending request.
 ```
 

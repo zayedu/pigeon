@@ -15,7 +15,9 @@ a Codex or Claude chat. Do not use the account instead.
 
 - **Share this chat.** Call `pigeon_share`. Give the user the key privately. Tell the user
   when automatic wake is unavailable.
-- **Start a new session.** Call `pigeon_share` again. Each key is a new session.
+- **Start a new session.** Call `pigeon_share` again. Each call creates another session.
+- **End one session.** Call `pigeon_close` with that session id. Other sessions stay open.
+  Past messages in the closed session stay readable.
 - **Join with this key.** Call `pigeon_connect` with the key.
 - **Show my sessions.** Call `pigeon_status` with no conversation id. It lists the peer,
   the state, and the session id.
