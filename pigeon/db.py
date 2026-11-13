@@ -347,7 +347,7 @@ class Store:
                 )
         return {"address": name, "key": key, "token": token, "expires_at": expires}
 
-    def redeem(self, reviewer: str, key: str) -> dict:
+    def redeem(self, reviewer: str, key: str, peer_session: bool = False) -> dict:
         digest = token_hash(key)
         now = time.time()
         with self.transaction() as db:
@@ -366,7 +366,7 @@ class Store:
             owner = db.execute(
                 "SELECT owner FROM session_shares WHERE recipient=?", (inbox,)
             ).fetchone()
-            if reviewer == inbox or (owner and reviewer == owner["owner"]):
+            if peer_session and (reviewer == inbox or (owner and reviewer == owner["owner"])):
                 raise PigeonError("invalid_key", "Open the other chat and join with this key.")
             if invite:
                 db.execute(
@@ -383,6 +383,9 @@ class Store:
                         "invalid_key", "This session key is invalid, expired, or in use."
                     )
                 conversation_id = current["conversation_id"]
+                if not peer_session and not conversation_id:
+                    db.execute("INSERT OR IGNORE INTO grants VALUES (?, ?)", (inbox, reviewer))
+                    return {"address": inbox}
                 if not conversation_id:
                     conversation_id = str(uuid4())
                     db.execute(
@@ -404,6 +407,7 @@ class Store:
                     "UPDATE session_shares SET reviewer=? WHERE recipient=?", (reviewer, inbox)
                 )
                 conversation_id = None
+                db.execute("INSERT OR IGNORE INTO grants VALUES (?, ?)", (inbox, reviewer))
         result = {"address": inbox}
         if conversation_id:
             result["conversation_id"] = conversation_id
@@ -496,11 +500,6 @@ class Store:
                     raise PigeonError(
                         "conflict", "Follow-ups require a completed turn. Check its status."
                     )
-            elif db.execute(
-                "SELECT 1 FROM shared_chats WHERE recipient=? OR recipient=?",
-                (sender, request.to),
-            ).fetchone():
-                raise PigeonError("forbidden", "Use the session created by the invitation.")
             elif not db.execute(
                 """SELECT 1 FROM grants g JOIN agents a ON a.address=g.recipient
                    WHERE g.sender=? AND g.recipient=? AND a.token_hash IS NOT NULL
