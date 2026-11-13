@@ -6,7 +6,7 @@ import sys
 import tempfile
 from pathlib import Path
 from stat import S_IMODE
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from conftest import ALICE, BOB
@@ -169,46 +169,40 @@ def test_invite_and_session_reply(relay, tmp_path):
 
 
 def test_session_key_between_two_chats_with_the_same_profile(relay, tmp_path):
-    from contextlib import AsyncExitStack
-
     profile = tmp_path / "shared.json"
     run_cli(profile, "login", relay.url, "--token-stdin", token=relay.alice)
     executable, *args = cli(profile, "mcp")
 
     async def exchange():
-        async with asyncio.timeout(15), AsyncExitStack() as stack:
-            chats = []
-            for _ in range(2):
-                streams = await stack.enter_async_context(
-                    stdio_client(StdioServerParameters(command=executable, args=args))
+        async with (
+            asyncio.timeout(15),
+            stdio_client(StdioServerParameters(command=executable, args=args)) as streams,
+            ClientSession(*streams) as owner,
+            open_client(relay.url, relay.bob) as reviewer,
+        ):
+            await owner.initialize()
+            key = (await owner.call_tool("pigeon_share", {})).structuredContent["result"]
+            async with open_client(relay.url, relay.alice) as owner_account:
+                with pytest.raises(PigeonError, match="other chat"):
+                    await owner_account.call(Redeem(key=key))
+            destination = await reviewer.call(Redeem(key=key))
+            question = asyncio.create_task(
+                reviewer.ask(
+                    destination["address"],
+                    "Why cache?",
+                    conversation_id=UUID(destination["conversation_id"]),
                 )
-                client = await stack.enter_async_context(ClientSession(*streams))
-                await client.initialize()
-                chats.append(client)
-            owner, reviewer = chats
-            shared = await owner.call_tool("pigeon_share", {})
-            key = shared.structuredContent["result"]
-            connected = await reviewer.call_tool("pigeon_connect", {"key": key})
-            destination = connected.structuredContent["result"]
-            async with open_client(relay.url, relay.bob) as stranger:
-                with pytest.raises(PigeonError, match="in use"):
-                    await stranger.call(Redeem(key=key))
-
-            async with asyncio.TaskGroup() as tasks:
-                question = tasks.create_task(
-                    reviewer.call_tool("pigeon_ask", {"to": destination, "message": "Why cache?"})
-                )
-                received = await owner.call_tool("pigeon_receive", {})
-                turn = Turn.model_validate(received.structuredContent["result"])
-                assert turn.request.content == "Why cache?"
-                answer = await owner.call_tool(
-                    "pigeon_answer",
-                    {"message_id": str(turn.request.id), "message": "To save time."},
-                )
-                assert not answer.isError
-            assert Turn.model_validate(question.result().structuredContent).response.content == (
-                "To save time."
             )
+            received = await owner.call_tool("pigeon_receive", {})
+            turn = Turn.model_validate(received.structuredContent["result"])
+            assert turn.request.content == "Why cache?"
+            answer = await owner.call_tool(
+                "pigeon_answer",
+                {"message_id": str(turn.request.id), "message": "To save time."},
+            )
+            assert not answer.isError
+            completed = await question
+            assert completed.response.content == "To save time."
 
     asyncio.run(exchange())
 
@@ -226,18 +220,17 @@ def test_chat_can_reinvite_and_answer_after_mcp_restart(relay, tmp_path):
             async with stdio_client(params) as streams, ClientSession(*streams) as owner:
                 await owner.initialize()
                 first = (await owner.call_tool("pigeon_share", {})).structuredContent["result"]
-                async with open_client(relay.url, relay.alice) as test_client:
-                    test_target = await test_client.call(Redeem(key=first))
+                async with open_client(relay.url, relay.alice) as owner_account:
+                    with pytest.raises(PigeonError, match="other chat"):
+                        await owner_account.call(Redeem(key=first))
                 second = (await owner.call_tool("pigeon_share", {})).structuredContent["result"]
                 assert second != first
                 target = await reviewer.call(Redeem(key=second))
-                assert target["address"] == test_target["address"]
-                assert target["conversation_id"] != test_target["conversation_id"]
                 assert target == await reviewer.call(Redeem(key=second))
                 question = await reviewer.turn(
                     Submit(
                         to=target["address"],
-                        conversation_id=uuid4(),
+                        conversation_id=target["conversation_id"],
                         message_id=uuid4(),
                         message="Can you still answer after reconnecting?",
                     )
@@ -325,7 +318,7 @@ def test_shared_chat_wakes_without_calling_receive(relay, tmp_path):
             question = await reviewer.turn(
                 Submit(
                     to=target["address"],
-                    conversation_id=uuid4(),
+                    conversation_id=target["conversation_id"],
                     message_id=uuid4(),
                     message="Why is this private detail here?",
                 )
@@ -418,7 +411,7 @@ def test_native_claude_wake_uses_the_sharing_sessions_inbox(relay, tmp_path, mon
             question = await reviewer.turn(
                 Submit(
                     to=target["address"],
-                    conversation_id=uuid4(),
+                    conversation_id=target["conversation_id"],
                     message_id=uuid4(),
                     message="Reviewer content stays in the relay.",
                 )
@@ -497,7 +490,7 @@ def test_claude_channel_wakes_the_sharing_session(relay, tmp_path):
                 question = await reviewer.turn(
                     Submit(
                         to=target["address"],
-                        conversation_id=uuid4(),
+                        conversation_id=target["conversation_id"],
                         message_id=uuid4(),
                         message="The reviewer text stays in the relay.",
                     )
