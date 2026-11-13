@@ -71,7 +71,8 @@ need.
 
 After reopening the same Codex or Claude Code chat, say “Check Pigeon” to
 reconnect to its inbox. It can answer a pending request using the original
-message ID. Sharing again renews the inbox and gives you a fresh key.
+message ID. If the chat lost that ID, ask the sender to cancel and resend.
+Sharing again gives you a fresh key for a separate session.
 
 ### Automatic delivery and troubleshooting
 
@@ -117,7 +118,7 @@ enable that channel for the session.
 ## 4. Talk
 
 Say “Ask them …” or “Answer their question” in either chat. Say “Show my
-sessions” when a chat has more than one; Pigeon will not guess which peer you
+sessions” when a chat has more than one open session; Pigeon will not guess which session you
 mean. A chat Pigeon cannot identify does not fall back to the account. Say
 “Check Pigeon” to read the inbox without waiting for a wake. Wake reports a
 new question. Reopening a chat does not run a question that was already claimed.

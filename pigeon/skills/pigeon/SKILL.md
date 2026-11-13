@@ -21,8 +21,8 @@ a Codex or Claude chat. Do not use the account instead.
 - **Join with this key.** Call `pigeon_connect` with the key.
 - **Show my sessions.** Call `pigeon_status` with no conversation id. It lists the peer,
   the state, and the session id.
-- **Ask them something.** Call `pigeon_ask`. When this chat has one session, the message
-  is enough. When it has several, ask which peer to use and pass that session id.
+- **Ask them something.** Call `pigeon_ask`. When this chat has one open session, the message
+  is enough. When it has several, confirm the intended session and pass its id.
   Never send to a guessed session.
 - **Ask a follow-up.** Call `pigeon_reply` after the previous request is answered.
   Either member can do this.
