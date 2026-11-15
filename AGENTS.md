@@ -75,9 +75,22 @@ path and point test profiles at `ws://127.0.0.1:8765`.
 uv run --locked pigeon relay serve --db /path/to/disposable/relay.sqlite3
 ```
 
-`tests/smoke_real.py` is an opt-in Claude Code to Codex daemon smoke test. Use
-real chats to verify changes to interactive wake when the clients and accounts
-are available. Report which clients and paths you actually exercised.
+`tests/smoke_real.py` is an opt-in Claude Code to Codex daemon smoke test.
+`tests/smoke_harnesses.py` uses a disposable local relay for each client. It
+exercises the Codex CLI with its app server, Claude Code with its native inbox,
+and Cursor and Antigravity through their ACP launchers. It checks sharing,
+first messages, follow-ups, and binary attachment delivery in both directions.
+It checks idle wake when supported and prompts an inbox check for Antigravity
+if its launcher has no wake support. Use signed-in CLIs with available usage.
+
+```sh
+uv run --locked python tests/smoke_harnesses.py
+uv run --locked python tests/smoke_harnesses.py claude --ollama --timeout 360
+```
+
+For the Ollama run, start a local Ollama server and pull `qwen3.5:4b`, or pass
+`--claude-model` with another installed model that supports tool calls. Report
+which clients and paths you actually exercised.
 
 ## Commit and hand off
 

@@ -13,17 +13,18 @@ import termios
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from conftest import ALICE, BOB, relay_process
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from websockets.asyncio.client import unix_connect
 
+from pigeon.attachments import download_file, upload_file
 from pigeon.client import open_client
-from pigeon.config import Config, save
+from pigeon.config import Config, load, save, state_path
 from pigeon.db import Store
-from pigeon.models import ACTIVE, Inspect, Redeem, Submit
+from pigeon.models import ACTIVE, Capabilities, Inspect, Redeem, Share, Submit
 
 
 async def app_call(socket, request_id, method, params):
@@ -91,7 +92,63 @@ async def terminal(codex, endpoint, thread, root):
         await asyncio.to_thread(os.waitpid, pid, 0)
 
 
-async def smoke(root, relay, owner_token, peer_token):
+async def exchange(peer, joined, timeout, *, follow_up, check_inbox=None):
+    token = f"PIGEON_{uuid4().hex[:12]}"
+    sent = await peer.turn(
+        Submit(
+            to=joined["address"],
+            conversation_id=joined["conversation_id"],
+            message_id=uuid4(),
+            message=f"Reply with exactly this test token: {token}",
+            timeout=timeout,
+        )
+    )
+    if check_inbox:
+        if sent.status != "queued":
+            raise RuntimeError("A manual request should queue before the inbox check.")
+        check_inbox()
+    query = Inspect(conversation_id=sent.request.conversation_id, message_id=sent.request.id)
+    while sent.status in ACTIVE:
+        sent = await peer.turn(query.model_copy(update={"after": sent.status, "wait": 5}))
+    if sent.status != "completed" or not sent.response or token not in sent.response.content:
+        raise RuntimeError(f"Expected the synthetic reply; relay status was {sent.status}.")
+    if sent.follow_up != follow_up:
+        raise RuntimeError("The relay lost the original conversation across messages.")
+
+
+async def attachment_round_trip(profile, peer, peer_token, joined):
+    configured = load(profile)
+    (identity_file,) = state_path(profile).glob("chats/*.json")
+    identity = Share.model_validate_json(identity_file.read_bytes())
+    async with open_client(configured.relay, configured.token) as session:
+        inbox = await session.call(identity.model_copy(update={"resume": True}))
+    owner = Config(relay=configured.relay, agent=inbox["address"], token=inbox["token"])
+    reviewer = Config(relay=configured.relay, agent=BOB, token=peer_token)
+    conversation = UUID(joined["conversation_id"])
+    await peer.call(Capabilities(features=["attachments", "manual_inbox"]))
+    source = profile.parent / "source.bin"
+    received = profile.parent / "received.bin"
+    returned = profile.parent / "returned.bin"
+    source.write_bytes(bytes(range(256)))
+
+    async def transfer(sender, recipient, origin, destination):
+        record = await asyncio.to_thread(upload_file, sender, conversation, origin)
+        await asyncio.to_thread(
+            download_file,
+            recipient,
+            conversation,
+            UUID(record["id"]),
+            destination,
+            record["sha256"],
+        )
+
+    await transfer(owner, reviewer, source, received)
+    await transfer(reviewer, owner, received, returned)
+    if returned.read_bytes() != source.read_bytes():
+        raise RuntimeError("Attachment bytes changed during the round trip.")
+
+
+async def smoke(root, relay, owner_token, peer_token, *, timeout=90):
     codex = shutil.which("codex")
     if not codex:
         raise SystemExit("Install and sign in to Codex before running this check.")
@@ -181,35 +238,22 @@ async def smoke(root, relay, owner_token, peer_token):
             ):
                 await mcp.initialize()
                 shared = await mcp.call_tool("pigeon_share")
-                assert not shared.isError
+                assert not shared.isError and shared.structuredContent["wake"]["attached"]
                 joined = await peer.call(
                     Redeem(key=shared.structuredContent["result"], peer_session=True)
                 )
-                sent = await peer.turn(
-                    Submit(
-                        to=joined["address"],
-                        conversation_id=joined["conversation_id"],
-                        message_id=uuid4(),
-                        message="Answer this smoke test with PIGEON_WAKE_OK.",
-                    )
-                )
-                query = Inspect(
-                    conversation_id=sent.request.conversation_id, message_id=sent.request.id
-                )
-                for _ in range(6):
-                    if sent.status not in ACTIVE:
-                        break
-                    sent = await peer.turn(
-                        query.model_copy(update={"after": sent.status, "wait": 5})
-                    )
-                    print(f"Request status: {sent.status}", flush=True)
-                if sent.status != "completed" or "PIGEON_WAKE_OK" not in sent.response.content:
-                    status = await mcp.call_tool("pigeon_status")
-                    wake = status.structuredContent["result"]["wake"]
-                    raise RuntimeError(
-                        f"Idle wake smoke ended at {sent.status}. Wake state: {wake}"
-                    )
-                print("Codex woke, claimed the request, and returned the expected response.")
+                print("codex: MCP share passed.", flush=True)
+                for follow_up in (False, True):
+                    stage = "follow-up wake" if follow_up else "idle wake"
+                    print(f"codex: checking {stage}.", flush=True)
+                    async with asyncio.timeout(timeout + 5):
+                        await exchange(peer, joined, timeout, follow_up=follow_up)
+                        async for data in socket:
+                            if json.loads(data).get("method") == "turn/completed":
+                                break
+                    print(f"codex: {stage} passed.", flush=True)
+                await attachment_round_trip(profile, peer, peer_token, joined)
+                print("codex: binary attachment round trip passed.", flush=True)
     finally:
         if proc.returncode is None:
             proc.terminate()

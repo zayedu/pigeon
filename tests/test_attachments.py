@@ -171,40 +171,11 @@ def test_attachment_cli_refuses_piped_confirmation(tmp_path):
     assert "test secret" not in result.stdout + result.stderr
 
 
-def test_attachment_cli_confirms_and_uploads(relay, tmp_path):
-    source = tmp_path / "input.txt"
-    source.write_text("approved")
-    cfg = Config(relay=relay.url, agent="@alice/codex", token=relay.alice)
-    profile = tmp_path / "alice.json"
-    save(profile, cfg)
-    chat = "codex:fixture"
-    identity = chat_share(profile, cfg, chat)
-
-    async def invite():
-        async with open_client(relay.url, relay.alice) as owner:
-            shared = await owner.call(identity)
-        async with open_client(relay.url, relay.bob) as peer:
-            joined = await peer.call(Redeem(key=shared["key"], peer_session=True))
-            await peer.call(Capabilities(features=["attachments"]))
-        return joined["conversation_id"]
-
-    session = asyncio.run(invite())
+def run_approved_attachment(profile, *args):
     master, terminal = pty.openpty()
     try:
         with subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "pigeon.cli",
-                "--config",
-                str(profile),
-                "attachment",
-                "upload",
-                session,
-                str(source),
-                "--chat",
-                chat,
-            ],
+            [sys.executable, "-m", "pigeon.cli", "--config", str(profile), "attachment", *args],
             stdin=terminal,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -221,12 +192,49 @@ def test_attachment_cli_confirms_and_uploads(relay, tmp_path):
     finally:
         os.close(master)
         os.close(terminal)
-    assert str(source) in output
-    record = json.loads(output[output.index("{") :])
+    assert "Authorize this transfer" in output
+    return json.loads(output[output.index("{") :])
+
+
+def test_attachment_cli_confirms_round_trip(relay, tmp_path):
+    source = tmp_path / "input.txt"
+    source.write_text("approved")
+    cfg = Config(relay=relay.url, agent="@alice/codex", token=relay.alice)
+    profile = tmp_path / "alice.json"
+    save(profile, cfg)
+    chat = "codex:fixture"
+    identity = chat_share(profile, cfg, chat)
+
+    async def invite():
+        async with open_client(relay.url, relay.alice) as owner:
+            shared = await owner.call(identity)
+        async with open_client(relay.url, shared["token"]) as chat_client:
+            await chat_client.call(Capabilities(features=["attachments"]))
+        async with open_client(relay.url, relay.bob) as peer:
+            joined = await peer.call(Redeem(key=shared["key"], peer_session=True))
+            await peer.call(Capabilities(features=["attachments"]))
+        return joined["conversation_id"]
+
+    session = asyncio.run(invite())
+    record = run_approved_attachment(profile, "upload", session, str(source), "--chat", chat)
     peer = Config(relay=relay.url, agent="@bob/claude", token=relay.bob)
     destination = tmp_path / "received.txt"
     download_file(peer, UUID(session), UUID(record["id"]), destination, record["sha256"])
     assert destination.read_text() == "approved"
+    reply = upload_file(peer, UUID(session), destination)
+    returned = tmp_path / "returned.txt"
+    run_approved_attachment(
+        profile,
+        "download",
+        session,
+        reply["id"],
+        str(returned),
+        "--sha256",
+        reply["sha256"],
+        "--chat",
+        chat,
+    )
+    assert returned.read_bytes() == source.read_bytes()
 
 
 def test_upload_refuses_symlink_and_fifo(tmp_path, monkeypatch):
