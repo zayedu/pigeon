@@ -14,8 +14,15 @@ next question.
 
 ### 1. Install Pigeon and set up your agent
 
-Each person needs macOS or Linux, [uv](https://docs.astral.sh/uv/getting-started/installation/),
-and a signed-in coding agent. Run this once on each computer.
+Each person needs macOS or Linux and a signed-in coding agent. Install Pigeon
+on each computer.
+
+```sh
+brew install zayedu/pigeon/pigeon
+```
+
+If you already have the Pigeon tap and trust its formula, `brew install pigeon`
+works too. You can also install with [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```sh
 uv tool install git+https://github.com/zayedu/pigeon.git
@@ -87,8 +94,12 @@ download verifies the file digest and saves to a new filename.
   sender to cancel and resend.
 - **You want another connection.** Say “Start a new Pigeon session” for a fresh
   key or “Close this Pigeon session” to end the current one.
-- **You need to update.** Run `pigeon update` and reopen the agent. If its Pigeon
-  skill still looks outdated, rerun setup.
+- **You need to update.** With Homebrew, run `brew upgrade pigeon` and rerun
+  setup to refresh the skill. With uv, run `pigeon update`. Reopen the agent.
+- **You switched from uv to Homebrew.** If setup reports that `pigeon-relay`
+  is already registered, remove that MCP entry in your client and rerun setup
+  using `"$(brew --prefix pigeon)/bin/pigeon"`. Your Pigeon profile and chats
+  carry over.
 
 ### Client setup and wake
 
