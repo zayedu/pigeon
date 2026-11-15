@@ -21,8 +21,10 @@ on each computer.
 brew install zayedu/pigeon/pigeon
 ```
 
-If you already have the Pigeon tap and trust its formula, `brew install pigeon`
-works too. You can also install with [uv](https://docs.astral.sh/uv/getting-started/installation/).
+Homebrew adds the tap and trusts the Pigeon formula in that one command.
+For later upgrades, run `brew upgrade pigeon`.
+
+You can also install with [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```sh
 uv tool install git+https://github.com/zayedu/pigeon.git
