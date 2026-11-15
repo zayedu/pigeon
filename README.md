@@ -1,174 +1,135 @@
 # Pigeon
 
-*Let your agent talk to mine.*
+Open-source messaging between coding agents.
 
-Ask a question in someone else's coding-agent chat and get the answer back in yours.
+Connect two existing chats with a key. A reviewer in Claude Code can ask the
+Codex chat that wrote a PR why it chose an approach, and the implementer can
+answer from the chat that already has the context. Either agent can ask the
+next question.
 
-## Before you start
+[Quickstart](#quickstart) · [File sharing](#file-sharing) ·
+[Troubleshooting](#troubleshooting) · [Contributing](#contributing)
 
-- macOS or Linux
-- Python 3.12+: `python3 --version`
-- [uv](https://docs.astral.sh/uv/): `uv --version`
-- Codex, Claude Code, Cursor, or Antigravity CLI, already signed in
+## Quickstart
 
-## 1. Install Pigeon
+### 1. Install Pigeon and set up your agent
+
+Each person needs macOS or Linux, [uv](https://docs.astral.sh/uv/getting-started/installation/),
+and a signed-in coding agent. Run this once on each computer.
 
 ```sh
 uv tool install git+https://github.com/zayedu/pigeon.git
 ```
 
-If this fails, install [uv](https://docs.astral.sh/uv/getting-started/installation/) and run it again.
+Run the setup command for your agent, choose a username when prompted, then
+open the chat from your project.
 
-## 2. Set up your agent
+| Agent | One-time setup | Open a chat |
+| --- | --- | --- |
+| Codex | `pigeon setup codex` | Reopen Codex |
+| Claude Code | `pigeon setup claude` | Run `claude` |
+| Cursor CLI | `pigeon setup cursor` | Run `pigeon wake cursor` |
+| Antigravity CLI | `pigeon setup antigravity` | Run `pigeon antigravity` |
 
-Each person runs this once for the agent they use. The client is `codex`,
-`claude`, `cursor`, or `antigravity`.
+Setup registers Pigeon’s tools through MCP. Pigeon uses the hosted relay by
+default. If you use several agents, run setup once for each.
 
-```sh
-pigeon setup codex
-```
+### 2. Share and join
 
-Choose a distinct username when asked. There is no invite code and no relay
-server to run locally. If you use more than one client, run setup once for each
-client; you can keep the same account username where supported.
+Tell the agent that did the work:
 
-```text
-Created @<username>/agent.
-Restart codex to load pigeon-relay.
-```
+> Share this chat with Pigeon.
 
-Cursor prints `Reload Cursor to load Pigeon.` Restart or reload the agent before continuing. If Pigeon says the username is taken, run the command again with another name. If it says the client is missing, install that client and put it on your `PATH`.
+Send the returned key privately to your teammate. They tell their agent:
 
-Setup installs the Pigeon MCP connection and skill. Restart the agent after
-setup. From then on, use plain language:
+> Join this Pigeon session with `<key>`.
 
-```text
-Share this chat with Pigeon.
-Use this Pigeon key to ask the other chat to check the authentication changes.
-Check Pigeon and reply to the pending request.
-```
+You can also try this with two chats on one computer. A key lets one other chat
+join within an hour. Once both chats are connected, the session stays open
+until you close it.
 
-Rerun setup if you add another client or need to repair its MCP configuration.
+### 3. Ask a question
 
-## 3. Share a chat
+From either chat, tell your agent:
 
-Ask one agent to share its current chat. It returns a short key. Send that key
-privately. The key lasts one hour and admits one other chat. Say “Start a new
-session” for another key. An existing session stays up after its key expires.
+> Ask the other chat why it changed the cache invalidation logic.
 
-The other person gives the key to their own agent: “Join with this key.” They
-do not need your username. Either chat can send the first message, and either
-can keep asking follow-ups in that same session.
+Pigeon can prompt a chat automatically when wake is attached. If you’re
+expecting a message, ask your agent to check Pigeon. Either chat can send a
+follow-up after the current question is answered.
 
-If either agent was already open during setup, restart it. To update later:
+## File sharing
 
-```sh
-pigeon update
-```
+Ask your agent to share a GitHub PR, diff, commit, or file reference. Use a full
+commit SHA to link to a specific revision.
 
-Then restart the agent to load the update. Pigeon refreshes stock copies of its
-skill and preserves local edits. If you upgraded from an older release and
-still see the old skill, run `pigeon setup` for your client once.
-
-After reopening the same Codex or Claude Code chat, say “Check Pigeon” to
-reconnect to its inbox. It can answer a pending request using the original
-message ID. If the chat lost that ID, ask the sender to cancel and resend.
-Sharing again gives you a fresh key for a separate session.
-
-### Automatic delivery and troubleshooting
-
-For automatic delivery in the **Codex CLI**, share from a chat running on the
-local Codex app-server daemon and keep that chat open. Pigeon attaches to it
-automatically. You normally do not need to run `pigeon wake`.
-
-If the CLI uses a separate server, reopen the chat explicitly with:
-
-```sh
-pigeon wake <THREAD_ID>
-```
-
-`<THREAD_ID>` is the UUID of that Codex thread. Ask the reopened chat to share.
-Keep the CLI chat running so Pigeon can prompt it when a question arrives.
-If Codex opens read-only, exit the same chat in the other app or terminal and
-press `r` to retry. If Codex asks for a working directory, choose the session
-directory to continue in the original worktree.
-
-For **Claude Code**, open `claude` normally and share the chat. Pigeon uses
-Claude's local cross-session inbox to wake it; no `pigeon wake claude` command is
-needed in the normal flow. Claude's inbound message settings still apply.
-[Claude Code inbox docs](https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket)
-
-When you share a chat, Pigeon reports whether it attached a wake listener.
-An unclaimed request can trigger up to two retries with backoff. Ask “Show my
-Pigeon sessions” for the last notification attempt and the last request this
-chat claimed. Use the request status to check whether it was answered.
-If Claude can't wake, run `/status` in Claude and check that it shows a peer
-address. Check **Messages from your other sessions** in `/config` if a wake is held.
-
-For **Cursor CLI**, open the answering chat from its project directory:
-
-```sh
-pigeon wake cursor
-```
-
-Add a saved session ID after the client name to resume a conversation. Close the
-previous session before resuming it. Cursor runs in Pigeon's terminal through ACP.
-Share the chat after it opens and keep it running.
-
-Only use `pigeon wake claude` as a diagnostic fallback when the native inbox is
-not available. It uses Claude's development Channels preview and will ask you to
-enable that channel for the session.
-
-For **Antigravity CLI**, sign in with `agy` and run `pigeon setup antigravity`
-once. Run `pigeon antigravity` from your project to open a chat with Pigeon
-registered through ACP. Pass the printed session ID to reopen that chat.
-Check the inbox by saying “Check Pigeon.” This integration uses manual delivery.
-The signed-in flow is still experimental. Pigeon verified the ACP handshake
-with `agy` 1.5.9.
-
-## 4. Talk
-
-Say “Ask them …” or “Answer their question” in either chat. Say “Show my
-sessions” when a chat has more than one open session; Pigeon will not guess which session you
-mean. A chat Pigeon cannot identify does not fall back to the account. Say
-“Check Pigeon” to read the inbox without waiting for a wake. Wake reports a
-new question or a reply to a question this chat sent. Reopening a chat does
-not run a question that was already claimed.
-
-Pigeon prompts a chat automatically when wake is enabled for that client.
-Wake tells the agent to read the inbox and session status. The agent answers
-a waiting question. A finished answer stays on that same turn. If wake is
-unavailable, “Check Pigeon” still works.
-
-## Share files and references
-
-Ask your agent for the Pigeon session ID and your host chat ID. Run the transfer
-from your own terminal and confirm the path and session when prompted.
+For a local file, ask your agent for the Pigeon session ID and your chat ID.
+Run and confirm the transfer in your own terminal. Send the returned attachment
+ID and SHA-256 to the other chat.
 
 ```sh
 pigeon attachment upload SESSION_ID ./diagram.png --chat 'codex:<thread-id>'
-pigeon attachment download SESSION_ID ATTACHMENT_ID ./received.png --chat 'codex:<thread-id>'
+pigeon attachment download SESSION_ID ATTACHMENT_ID ./received.png --chat 'codex:<thread-id>' --sha256 SENDER_SHA256
 ```
 
-Share the upload's attachment ID and SHA-256 in your Pigeon chat. Pass the
-sender's digest with `--sha256` when downloading. Files up to 1 MiB are available
-to members of the open session for one hour. Downloads verify the digest and
-require a new filename. Pigeon chat tools can relay references to files. Local
-file access requires the terminal confirmation.
+Members of the open session can download files up to 1 MiB for one hour. The
+download verifies the file digest and saves to a new filename.
 
-For a GitHub PR, diff, commit, or repository file, ask your agent to send a
-reference. That shares a link without copying the underlying material. Use a
-full commit SHA to pin a file to a specific revision.
+## Troubleshooting
 
-## Inspect a session
+- **Pigeon tools are missing.** Run setup for your agent and reopen the chat.
+- **A reply is pending.** Say “Show my Pigeon sessions” or “Check Pigeon.” When
+  you reopen the same chat, check Pigeon to reconnect to its inbox. To finish
+  a claimed request, use its original message ID. If you lost it, ask the
+  sender to cancel and resend.
+- **You want another connection.** Say “Start a new Pigeon session” for a fresh
+  key or “Close this Pigeon session” to end the current one.
+- **You need to update.** Run `pigeon update` and reopen the agent. If its Pigeon
+  skill still looks outdated, rerun setup.
 
-Ask your agent to show its Pigeon sessions for peers, pending requests, and
-live wake diagnostics. From the terminal, use the host's original chat ID.
+<details>
+<summary>Automatic wake by client</summary>
+
+When you share a chat, Pigeon reports whether it attached a wake listener.
+Keep the chat open for automatic delivery. If wake is unavailable, ask the
+agent to check Pigeon.
+
+- **Codex CLI.** Wake attaches to a chat running on the local Codex app-server
+  daemon. For a chat on a separate server, open it with
+  `pigeon wake <thread-id>` and share it from there. If the chat opens
+  read-only, close it in the other window and press `r`. If prompted, choose
+  the original session directory to stay in its worktree.
+- **Claude Code.** Pigeon uses the local session inbox. If wake fails, check
+  for a peer address in `/status` and review **Messages from your other
+  sessions** in `/config`. The `pigeon wake claude` command uses the
+  development Channels preview as a diagnostic fallback.
+  [Claude Code inbox docs](https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket)
+- **Cursor CLI.** Open the chat with `pigeon wake cursor`. To resume a chat,
+  close the old instance and add its saved session ID to the command.
+- **Antigravity CLI.** Open the chat with `pigeon antigravity` and ask it to
+  check Pigeon. If Pigeon reports a wake listener, keep the launcher open
+  for automatic inbox checks. Antigravity’s tool approval settings apply.
+  Add the printed session ID to reopen the same chat.
+
+</details>
+
+<details>
+<summary>Inspect a chat from the terminal</summary>
 
 ```sh
 pigeon status --chat 'codex:<thread-id>' --pending
 pigeon doctor --chat 'codex:<thread-id>'
 ```
 
-Replace the placeholder with your ID. Use `claude:`, `cursor:`, or
-`antigravity:` for those hosts.
+Use your host’s chat ID and the matching prefix, such as `claude:`, `cursor:`,
+or `antigravity:`.
+
+</details>
+
+## Contributing
+
+See the [contributor guide](AGENTS.md) for local development and tests, the
+[relay protocol](PROTOCOL.md) for implementation details, and the
+[roadmap](ROADMAP.md) for planned work.
+
+Pigeon is available under the [MIT license](LICENSE).
