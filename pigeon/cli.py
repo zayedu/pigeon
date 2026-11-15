@@ -66,6 +66,7 @@ app.add_typer(attachment_app, name="attachment")
 Database = Annotated[Path, typer.Option("--db", help="Relay SQLite database.")]
 Wait = Annotated[int, typer.Option(min=0, max=60, help="Seconds to wait for a response.")]
 HOSTED_RELAY = "wss://pigeon-relay-rust.vercel.app"
+HOMEBREW_LAUNCHER_ENV = "PIGEON_HOMEBREW_LAUNCHER"
 # Hashes of stock skills shipped before installations recorded their own digest.
 LEGACY_SKILL_DIGESTS = {
     "1c938188b9e398f1085f5de06fa7cfbea3816a9f7f93c3b36b91eec8573c6e08",
@@ -81,6 +82,9 @@ LEGACY_SKILL_DIGESTS = {
 @app.command()
 def update():
     """Install the latest Pigeon and keep your account and chat state."""
+    if os.environ.get(HOMEBREW_LAUNCHER_ENV):
+        typer.echo("Run brew upgrade pigeon, then rerun pigeon setup for your client.")
+        return
     uv = shutil.which("uv")
     if uv is None:
         raise PigeonError("uv_missing", "Install uv and put it on your PATH.")
@@ -855,7 +859,9 @@ def install(
 
 def register_mcp(path: Path, host: str, scope: str, *, name: str):
     load(path)
-    command = [sys.executable, "-m", "pigeon.cli", "--config", str(path), "mcp"]
+    launcher = os.environ.get(HOMEBREW_LAUNCHER_ENV)
+    command = [launcher] if launcher else [sys.executable, "-m", "pigeon.cli"]
+    command.extend(["--config", str(path), "mcp"])
     if host == "cursor":
         register_cursor(Path.home() / ".cursor" / "mcp.json", name, command)
         typer.echo("Reload Cursor to load Pigeon.")
@@ -867,7 +873,7 @@ def register_mcp(path: Path, host: str, scope: str, *, name: str):
         [binary, "mcp", "get", name], capture_output=True, text=True, check=False
     )
     if existing.returncode == 0:
-        if str(path) in existing.stdout and "pigeon.cli" in existing.stdout:
+        if str(path) in existing.stdout and (launcher or "pigeon.cli") in existing.stdout:
             typer.echo(f"Restart {host} to load {name}.")
             return
         raise PigeonError(
