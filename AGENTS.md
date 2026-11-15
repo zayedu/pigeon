@@ -22,8 +22,8 @@ relay is the default for users. Use an isolated relay for development.
   profiles, and local chat identity. `pigeon/skills/pigeon/SKILL.md` is the
   bundled guidance for agents using Pigeon.
 - `pigeon/mcp.py` exposes the tools used by interactive chats.
-  `pigeon/wake.py` and `pigeon/cursor_acp.py` handle client-specific wake and
-  Cursor CLI integration. `pigeon/daemon.py` and `pigeon/adapters.py` serve the
+  `pigeon/wake.py` and `pigeon/acp.py` handle client-specific wake and
+  Cursor and Antigravity CLI integration. `pigeon/daemon.py` and `pigeon/adapters.py` serve the
   separate headless agent workflow.
 - `pigeon/models.py` and `pigeon/client.py` define wire frames and client calls.
   `pigeon/server.py` dispatches relay operations. `pigeon/db.py` handles

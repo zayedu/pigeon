@@ -9,7 +9,7 @@ Ask a question in someone else's coding-agent chat and get the answer back in yo
 - macOS or Linux
 - Python 3.12+: `python3 --version`
 - [uv](https://docs.astral.sh/uv/): `uv --version`
-- Codex, Claude Code, or Cursor, already signed in
+- Codex, Claude Code, Cursor, or Antigravity CLI, already signed in
 
 ## 1. Install Pigeon
 
@@ -22,7 +22,7 @@ If this fails, install [uv](https://docs.astral.sh/uv/getting-started/installati
 ## 2. Set up your agent
 
 Each person runs this once for the agent they use. The client is `codex`,
-`claude`, or `cursor`.
+`claude`, `cursor`, or `antigravity`.
 
 ```sh
 pigeon setup codex
@@ -66,8 +66,9 @@ If either agent was already open during setup, restart it. To update later:
 pigeon update
 ```
 
-Then restart the agent again. This is the only maintenance command most users
-need.
+Then restart the agent to load the update. Pigeon refreshes stock copies of its
+skill and preserves local edits. If you upgraded from an older release and
+still see the old skill, run `pigeon setup` for your client once.
 
 After reopening the same Codex or Claude Code chat, say “Check Pigeon” to
 reconnect to its inbox. It can answer a pending request using the original
@@ -98,6 +99,9 @@ needed in the normal flow. Claude's inbound message settings still apply.
 [Claude Code inbox docs](https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket)
 
 When you share a chat, Pigeon reports whether it attached a wake listener.
+Ask “Show my Pigeon sessions” to check the listener and its latest notification
+attempt. Check the request's status separately to see whether it was claimed or
+answered.
 If Claude can't wake, run `/status` in Claude and check that it shows a peer
 address. Check **Messages from your other sessions** in `/config` if a wake is held.
 
@@ -115,15 +119,46 @@ Only use `pigeon wake claude` as a diagnostic fallback when the native inbox is
 not available. It uses Claude's development Channels preview and will ask you to
 enable that channel for the session.
 
+For **Antigravity CLI**, sign in with `agy` and run `pigeon setup antigravity`
+once. Run `pigeon antigravity` from your project to open a chat with Pigeon
+registered through ACP. Pass the printed session ID to reopen that chat.
+Check the inbox by saying “Check Pigeon.” This integration uses manual delivery.
+
 ## 4. Talk
 
 Say “Ask them …” or “Answer their question” in either chat. Say “Show my
 sessions” when a chat has more than one open session; Pigeon will not guess which session you
 mean. A chat Pigeon cannot identify does not fall back to the account. Say
 “Check Pigeon” to read the inbox without waiting for a wake. Wake reports a
-new question. Reopening a chat does not run a question that was already claimed.
+new question or a reply to a question this chat sent. Reopening a chat does
+not run a question that was already claimed.
 
 Pigeon prompts a chat automatically when wake is enabled for that client.
-Wake tells the agent a question is waiting. The agent still has to read it and
-answer. An answer does not start another question. If wake is unavailable,
-“Check Pigeon” still works.
+Wake tells the agent to read the inbox and session status. The agent answers
+a waiting question. A finished answer stays on that same turn. If wake is
+unavailable, “Check Pigeon” still works.
+
+## Share files and references
+
+Ask your agent to send a specific local file. Both chats need attachment
+support. Files up to 1 MiB travel through a separate authenticated transfer.
+Only the two members of an open session can download them, and links expire
+after one hour. To receive a file, tell your agent where to save it. Downloads
+verify the digest and require a new filename.
+
+For a GitHub PR, diff, commit, or repository file, ask your agent to send a
+reference. That shares a link without copying the underlying material. Use a
+full commit SHA to pin a file to a specific revision.
+
+## Inspect a session
+
+Ask your agent to show its Pigeon sessions for peers, pending requests, and
+live wake diagnostics. From the terminal, use the host's original chat ID.
+
+```sh
+pigeon status --chat 'codex:<thread-id>' --pending
+pigeon doctor --chat 'codex:<thread-id>'
+```
+
+Replace the placeholder with your ID. Use `claude:`, `cursor:`, or
+`antigravity:` for those hosts.

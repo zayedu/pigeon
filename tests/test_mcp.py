@@ -46,8 +46,10 @@ def run_cli(config, *args, token=None):
 def test_failed_wake_leaves_the_request_queued(relay):
     async def exchange():
         token = secrets.token_urlsafe(32)
+        attempted = asyncio.Event()
 
         async def fail():
+            attempted.set()
             raise OSError("notify failed")
 
         async with open_client(relay.url, relay.alice) as owner:
@@ -63,11 +65,13 @@ def test_failed_wake_leaves_the_request_queued(relay):
                 )
             )
         config = Config(relay=relay.url, token=token, agent=shared["address"])
-        task = asyncio.create_task(listen(config, fail))
-        await asyncio.sleep(0.4)
+        diagnostics = {}
+        task = asyncio.create_task(listen(config, fail, diagnostics=diagnostics))
+        await asyncio.wait_for(attempted.wait(), timeout=5)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+        assert diagnostics["last_notification"]["state"] == "failed"
         async with open_client(relay.url, token) as inbox:
             pending = await inbox.call(Watch(wait=0))
             assert pending["message_id"]
@@ -105,6 +109,9 @@ def test_cli_daemon_and_stdio_mcp(relay, tmp_path):
                 "pigeon_share",
                 "pigeon_receive",
                 "pigeon_answer",
+                "pigeon_capabilities",
+                "pigeon_upload",
+                "pigeon_download",
             }
 
             refused = await mcp.call_tool("pigeon_ask", {"to": ALICE, "message": "Why cache?"})
@@ -329,6 +336,108 @@ def test_setup_creates_named_profile_without_invite(relay, tmp_path):
     assert "username is taken" in collision.stderr
 
 
+def test_refresh_skills_updates_managed_copy_and_preserves_local_edits(tmp_path, monkeypatch):
+    import hashlib
+
+    from pigeon.cli import install_skill, refresh_skills
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    claude_root = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_root))
+    install_skill("codex")
+    install_skill("claude")
+    skill = tmp_path / ".agents" / "skills" / "pigeon" / "SKILL.md"
+    edited = claude_root / "skills" / "pigeon" / "SKILL.md"
+    current = skill.read_bytes()
+    old = b"Previous bundled skill."
+    skill.write_bytes(old)
+    skill.with_name(".pigeon-skill.sha256").write_text(hashlib.sha256(old).hexdigest())
+    edited.write_text("My local instructions.")
+
+    refresh_skills()
+
+    assert skill.read_bytes() == current
+    assert edited.read_text() == "My local instructions."
+
+
+def test_antigravity_setup_and_resume_use_chat_scoped_mcp(relay, tmp_path):
+    import json
+
+    fake = tmp_path / "agy"
+    fake.write_text(
+        f"""#!{sys.executable}
+import json, sys
+from pathlib import Path
+assert sys.argv[1:] == ["acp"]
+for line in sys.stdin:
+    frame = json.loads(line)
+    if frame["method"] == "session/resume":
+        Path({str(tmp_path / "resume.json")!r}).write_text(json.dumps(frame["params"]))
+    print(json.dumps({{"jsonrpc": "2.0", "id": frame["id"], "result": {{}}}}), flush=True)
+"""
+    )
+    fake.chmod(0o700)
+    env = os.environ | {
+        "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+        "HOME": str(tmp_path),
+    }
+    profile = tmp_path / "agy.json"
+    subprocess.run(
+        cli(profile, "setup", "antigravity", "--username", "agy", "--relay", relay.url),
+        env=env,
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert (tmp_path / ".gemini/antigravity-cli/skills/pigeon/SKILL.md").is_file()
+    session_id = str(uuid4())
+    completed = subprocess.run(
+        cli(profile, "antigravity", session_id),
+        env=env,
+        input="/exit\n",
+        text=True,
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert session_id in completed.stdout
+    registration = json.loads((tmp_path / "resume.json").read_text())
+    assert registration["sessionId"] == session_id
+    args = registration["mcpServers"][0]["args"]
+    assert args[-2] == "--antigravity-session-file"
+    assert str(profile) in args
+
+
+def test_antigravity_inboxes_are_distinct_and_resumable(relay, tmp_path):
+    profile = tmp_path / "agy.json"
+    run_cli(profile, "login", relay.url, "--token-stdin", token=relay.alice)
+    first, second = tmp_path / "first.session", tmp_path / "second.session"
+    first.write_text(str(uuid4()))
+    second.write_text(str(uuid4()))
+
+    async def share(session_file):
+        executable, *args = cli(profile, "mcp", "--antigravity-session-file", str(session_file))
+        async with (
+            stdio_client(StdioServerParameters(command=executable, args=args)) as streams,
+            ClientSession(*streams) as mcp,
+            open_client(relay.url, relay.bob) as peer,
+        ):
+            await mcp.initialize()
+            shared = await mcp.call_tool("pigeon_share", {})
+            assert "unavailable" in shared.content[1].text
+            joined = await peer.call(
+                Redeem(key=shared.structuredContent["result"], peer_session=True)
+            )
+            return joined["address"]
+
+    first_address = asyncio.run(share(first))
+    assert asyncio.run(share(second)) != first_address
+    assert asyncio.run(share(first)) == first_address
+    chat = f"antigravity:{first.read_text()}"
+    result = run_cli(profile, "status", "--chat", chat)
+    assert first_address in result.stdout
+
+
 def test_shared_chat_wakes_without_calling_receive(relay, tmp_path):
 
     profile = tmp_path / "owner.json"
@@ -375,6 +484,19 @@ def test_shared_chat_wakes_without_calling_receive(relay, tmp_path):
             wake_args = wake_log.read_text().splitlines()
             assert wake_args[:6] == ["queue", "--remote", endpoint, "--thread", thread, "--message"]
             assert question.request.content not in wake_args[6]
+            while True:
+                status = await owner.call_tool("pigeon_status", {})
+                wake = status.structuredContent["result"]["wake"]
+                assert wake["attached"]
+                if wake["last_notification"]["state"] == "sent":
+                    break
+                await asyncio.sleep(0.05)
+            await owner.call_tool("pigeon_share", {})
+            status = await owner.call_tool("pigeon_status", {})
+            assert (
+                status.structuredContent["result"]["wake"]["last_notification"]
+                == (wake["last_notification"])
+            )
             assert (
                 await reviewer.turn(Inspect(conversation_id=question.request.conversation_id))
             ).status == "queued"

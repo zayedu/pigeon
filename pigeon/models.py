@@ -1,10 +1,13 @@
 from typing import Annotated, Literal
+from urllib.parse import quote
 
 from pydantic import UUID4, BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
 MAX_FRAME = 64 * 1024
 MAX_TEXT = 4_000
 MAX_WAIT = 20
+MAX_ATTACHMENT = 1024 * 1024
+RELAY_FEATURES = ("attachments", "peer_capabilities", "activity_watch")
 Username = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")]
 
 Address = Annotated[str, Field(pattern=r"^@[a-z0-9][a-z0-9_-]{0,31}/[a-z0-9][a-z0-9_-]{0,31}$")]
@@ -12,6 +15,7 @@ address = TypeAdapter(Address)
 Content = Annotated[str, Field(min_length=1, max_length=MAX_TEXT)]
 Status = Literal["queued", "running", "completed", "failed", "cancelled", "timed_out"]
 ACTIVE = ("queued", "running")
+Repository = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$")]
 
 
 class Frame(BaseModel):
@@ -20,10 +24,7 @@ class Frame(BaseModel):
 
 class Context(Frame):
     type: Literal["github_pr"]
-    repo: Annotated[
-        str,
-        Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$"),
-    ]
+    repo: Repository
     number: Annotated[int, Field(strict=True, ge=1, le=2**31 - 1)]
 
     @field_validator("repo")
@@ -32,6 +33,30 @@ class Context(Frame):
         if value.partition("/")[2] in {".", ".."}:
             raise ValueError("Use a GitHub owner and repository name.")
         return value
+
+
+class GitHubReference(Frame):
+    repo: Repository
+    kind: Literal["pr", "diff", "commit", "file"]
+    pr: Annotated[int, Field(ge=1, le=2**31 - 1)] | None = None
+    commit: Annotated[str, Field(pattern=r"^[a-fA-F0-9]{40}$")] | None = None
+    path: Annotated[str, Field(min_length=1, max_length=240)] | None = None
+
+    def url(self) -> str:
+        # Apply the same repository validation as existing PR context.
+        try:
+            repo = Context(type="github_pr", repo=self.repo, number=1).repo
+        except ValueError:
+            raise PigeonError("reference", "Use a GitHub owner and repository name.") from None
+        base = f"https://github.com/{repo}"
+        if self.kind in ("pr", "diff") and self.pr and not (self.commit or self.path):
+            return f"{base}/pull/{self.pr}" + ("/files" if self.kind == "diff" else "")
+        if self.kind == "commit" and self.commit and not (self.pr or self.path):
+            return f"{base}/commit/{self.commit}"
+        if self.kind == "file" and self.commit and self.path and not self.pr:
+            if all(part not in {"", ".", ".."} for part in self.path.split("/")):
+                return f"{base}/blob/{self.commit}/{quote(self.path)}"
+        raise PigeonError("reference", "Supply a PR number or a commit SHA, with a path for files.")
 
 
 class Submit(Frame):
@@ -60,6 +85,24 @@ class Take(Frame):
 class Watch(Frame):
     op: Literal["watch"] = "watch"
     wait: Annotated[int, Field(strict=True, ge=0, le=MAX_WAIT)] = MAX_WAIT
+
+
+class ActivityWatch(Frame):
+    op: Literal["activity_watch"] = "activity_watch"
+    wait: Annotated[int, Field(strict=True, ge=0, le=MAX_WAIT)] = MAX_WAIT
+    skip: Annotated[list[UUID4], Field(max_length=64)] = Field(default_factory=list)
+    replies: Annotated[list[UUID4], Field(max_length=50)] = Field(default_factory=list)
+
+
+class Capabilities(Frame):
+    op: Literal["capabilities"] = "capabilities"
+    conversation_id: UUID4 | None = None
+    features: (
+        Annotated[
+            list[Literal["wake", "attachments", "websocket", "manual_inbox"]], Field(max_length=4)
+        ]
+        | None
+    ) = None
 
 
 class Finish(Frame):
@@ -126,6 +169,8 @@ Command = (
     | Share
     | Redeem
     | Watch
+    | ActivityWatch
+    | Capabilities
 )
 command = TypeAdapter(Annotated[Command, Field(discriminator="op")])
 

@@ -139,10 +139,11 @@ async def ask_agent(
     to: str | None = None,
     context: Context | None = None,
     conversation_id: UUID | None = None,
+    message_id: UUID | None = None,
     wait: int = 15,
 ) -> Turn:
     conversation_id = conversation_id or uuid4()
-    message_id = uuid4()
+    message_id = message_id or uuid4()
     loop = asyncio.get_running_loop()
     until = loop.time() + wait
     submitted = False

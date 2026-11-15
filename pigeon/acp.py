@@ -3,16 +3,17 @@ import json
 import os
 import sys
 import tempfile
-from contextlib import suppress
+from contextlib import AsyncExitStack, suppress
 from pathlib import Path
 
 from .models import PigeonError
 from .wake import WAKE_PROMPT
 
 
-class CursorACP:
-    def __init__(self, process: asyncio.subprocess.Process):
+class ACPClient:
+    def __init__(self, process: asyncio.subprocess.Process, name: str):
         self.process = process
+        self.name = name
         self.pending = {}
         self.next_id = 0
         self.session_id = None
@@ -38,12 +39,12 @@ class CursorACP:
         try:
             await self.read_messages()
         except (OSError, ValueError) as exc:
-            raise PigeonError("cursor_acp", "Cursor sent an invalid ACP response.") from exc
+            raise PigeonError("acp", f"{self.name} sent an invalid ACP response.") from exc
         finally:
             for future in self.pending.values():
                 if not future.done():
                     future.set_exception(
-                        PigeonError("cursor_closed", "The Cursor ACP connection closed.")
+                        PigeonError("acp_closed", f"The {self.name} ACP connection closed.")
                     )
 
     async def read_messages(self):
@@ -66,7 +67,7 @@ class CursorACP:
                 ):
                     self.approval = message
                     tool = message["params"]["toolCall"].get("title") or "tool call"
-                    print(f"\nCursor requests permission for {tool}.", flush=True)
+                    print(f"\n{self.name} requests permission for {tool}.", flush=True)
                     for i, option in enumerate(message["params"]["options"], 1):
                         print(f"{i}. {option['name']}", flush=True)
                     print("Enter an option number, or press Enter to cancel.", flush=True)
@@ -82,13 +83,13 @@ class CursorACP:
                     if "error" in message:
                         future.set_exception(
                             PigeonError(
-                                "cursor_acp",
-                                message["error"].get("message", "Cursor rejected a request."),
+                                "acp",
+                                message["error"].get("message", f"{self.name} rejected a request."),
                             )
                         )
                     else:
                         future.set_result(message.get("result"))
-        raise PigeonError("cursor_closed", "The Cursor ACP process exited.")
+        raise PigeonError("acp_closed", f"The {self.name} ACP process exited.")
 
     async def read_input(self, prompts):
         reader = asyncio.StreamReader()
@@ -130,12 +131,13 @@ class CursorACP:
                     timeout=None,
                 )
             except PigeonError as exc:
-                print(f"\nCursor: {exc}", file=sys.stderr)
+                print(f"\n{self.name}: {exc}", file=sys.stderr)
             print("\n> ", end="", flush=True)
 
 
-async def run_cursor(binary: str, profile: Path, session_id: str | None):
+async def run_acp(binary: str, profile: Path, session_id: str | None, *, antigravity: bool = False):
     prompts = asyncio.Queue()
+    name = "Antigravity" if antigravity else "Cursor"
 
     async def enqueue_wake(_reader, writer):
         try:
@@ -149,7 +151,12 @@ async def run_cursor(binary: str, profile: Path, session_id: str | None):
 
     with tempfile.TemporaryDirectory(prefix="pigeon-", dir="/tmp") as directory:
         endpoint = str(Path(directory) / "wake.sock")
-        async with await asyncio.start_unix_server(enqueue_wake, path=endpoint):
+        session_file = Path(endpoint).with_suffix(".session")
+        async with AsyncExitStack() as stack:
+            if not antigravity:
+                await stack.enter_async_context(
+                    await asyncio.start_unix_server(enqueue_wake, path=endpoint)
+                )
             proc = await asyncio.create_subprocess_exec(
                 binary,
                 "acp",
@@ -157,7 +164,7 @@ async def run_cursor(binary: str, profile: Path, session_id: str | None):
                 stdout=asyncio.subprocess.PIPE,
                 limit=4 * 1024 * 1024,
             )
-            client = CursorACP(proc)
+            client = ACPClient(proc, name)
             tasks = [asyncio.create_task(client.read())]
             try:
                 await client.request(
@@ -168,7 +175,9 @@ async def run_cursor(binary: str, profile: Path, session_id: str | None):
                         "clientInfo": {"name": "pigeon", "version": "0.1.0"},
                     },
                 )
-                await client.request("authenticate", {"methodId": "cursor_login"})
+                if not antigravity:
+                    await client.request("authenticate", {"methodId": "cursor_login"})
+                flag = "--antigravity-session-file" if antigravity else "--cursor-endpoint"
                 params = {
                     "cwd": os.getcwd(),
                     "mcpServers": [
@@ -181,8 +190,8 @@ async def run_cursor(binary: str, profile: Path, session_id: str | None):
                                 "--config",
                                 str(profile),
                                 "mcp",
-                                "--cursor-endpoint",
-                                endpoint,
+                                flag,
+                                str(session_file) if antigravity else endpoint,
                             ],
                             "env": [],
                         }
@@ -190,15 +199,13 @@ async def run_cursor(binary: str, profile: Path, session_id: str | None):
                 }
                 if session_id is not None:
                     params["sessionId"] = session_id
-                result = await client.request(
-                    "session/load" if session_id else "session/new", params
-                )
+                resume = "session/resume" if antigravity else "session/load"
+                method = resume if session_id else "session/new"
+                result = await client.request(method, params)
                 client.session_id = session_id or result["sessionId"]
-                Path(endpoint).with_suffix(".session").write_text(
-                    client.session_id, encoding="utf-8"
-                )
+                session_file.write_text(client.session_id, encoding="utf-8")
                 print(
-                    f"Cursor session {client.session_id}. Type /exit to leave.\n> ",
+                    f"{name} session {client.session_id}. Type /exit to leave.\n> ",
                     end="",
                     flush=True,
                 )

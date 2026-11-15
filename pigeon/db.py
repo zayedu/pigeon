@@ -8,7 +8,17 @@ from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
-from .models import Cancel, Finish, Inspect, PigeonError, Submit, address
+from .models import (
+    ACTIVE,
+    MAX_ATTACHMENT,
+    ActivityWatch,
+    Cancel,
+    Finish,
+    Inspect,
+    PigeonError,
+    Submit,
+    address,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -73,6 +83,20 @@ CREATE TABLE IF NOT EXISTS turns (
 CREATE INDEX IF NOT EXISTS conversation_turns ON turns(conversation_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS active_turns ON turns(status, deadline)
     WHERE status IN ('queued', 'running');
+CREATE TABLE IF NOT EXISTS chat_capabilities (
+    agent TEXT PRIMARY KEY REFERENCES agents,
+    features TEXT NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS attachments (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations,
+    filename TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    data BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS attachment_expiry ON attachments(expires_at);
 """
 
 MIGRATIONS = (
@@ -101,7 +125,11 @@ FROM turns t JOIN conversations c ON c.id = t.conversation_id
 
 QUEUED = """
  WHERE COALESCE(t.recipient, c.recipient)=? AND t.deadline>? AND t.status='queued'
- ORDER BY t.rowid LIMIT 1"""
+"""
+OLDEST = " ORDER BY t.rowid LIMIT 1"
+WATCH_HEADERS = """
+SELECT t.id, t.deadline FROM turns t JOIN conversations c ON c.id=t.conversation_id
+"""
 
 
 def token_hash(token: str) -> str:
@@ -575,7 +603,7 @@ class Store:
         with self.transaction(write=False) as db:
             rows = db.execute(
                 """SELECT c.id AS conversation_id, c.sender, c.recipient, c.closed,
-                          t.id AS message_id,
+                          t.id AS message_id, COALESCE(t.sender, c.sender) AS request_sender,
                           COALESCE(t.created_at, c.created_at) AS created_at, t.status
                    FROM conversations c LEFT JOIN turns t ON t.rowid=(
                        SELECT rowid FROM turns WHERE conversation_id=c.id
@@ -608,13 +636,117 @@ class Store:
 
     def next_message(self, recipient: str) -> dict | None:
         with self.transaction(write=False) as db:
-            row = db.execute(TURN + QUEUED, (recipient, time.time())).fetchone()
+            row = db.execute(WATCH_HEADERS + QUEUED + OLDEST, (recipient, time.time())).fetchone()
         return {"message_id": row["id"], "deadline": row["deadline"]} if row else None
+
+    def watch_activity(self, agent: str, frame: ActivityWatch) -> dict | None:
+        with self.transaction(write=False) as db:
+            skipped = ",".join("?" for _ in frame.skip)
+            exclude = f" AND t.id NOT IN ({skipped})" if frame.skip else ""
+            row = db.execute(
+                WATCH_HEADERS + QUEUED + exclude + OLDEST,
+                (agent, time.time(), *(str(item) for item in frame.skip)),
+            ).fetchone()
+            replies = []
+            if frame.replies:
+                placeholders = ",".join("?" for _ in frame.replies)
+                replies = db.execute(
+                    f"""SELECT t.id, t.conversation_id FROM turns t
+                        JOIN conversations c ON c.id=t.conversation_id
+                        WHERE COALESCE(t.sender, c.sender)=?
+                        AND t.status NOT IN (?, ?) AND t.id IN ({placeholders})""",
+                    (agent, *ACTIVE, *(str(item) for item in frame.replies)),
+                ).fetchall()
+        if row or replies:
+            incoming = {"id": row["id"], "deadline": row["deadline"]} if row else None
+            return {"incoming": incoming, "replies": [dict(r) for r in replies]}
+        return None
+
+    def session_peer(self, db, agent: str, conversation_id: str) -> str:
+        row = db.execute(
+            """SELECT sender, recipient FROM conversations WHERE id=? AND closed=0
+               AND (sender=? OR recipient=?)
+               AND EXISTS (SELECT 1 FROM chat_invites WHERE conversation_id=?)""",
+            (conversation_id, agent, agent, conversation_id),
+        ).fetchone()
+        if not row:
+            raise PigeonError("not_found", "Open session not found.")
+        return row["recipient"] if row["sender"] == agent else row["sender"]
+
+    def capabilities(self, agent: str, conversation_id: str | None, features: list | None):
+        now = time.time()
+        with self.transaction(write=features is not None) as db:
+            if features is not None:
+                db.execute(
+                    """INSERT INTO chat_capabilities VALUES (?, ?, ?)
+                       ON CONFLICT(agent) DO UPDATE SET features=excluded.features,
+                       expires_at=excluded.expires_at""",
+                    (agent, json.dumps(features), now + 60),
+                )
+            peer = self.session_peer(db, agent, conversation_id) if conversation_id else agent
+            row = db.execute(
+                "SELECT features, expires_at FROM chat_capabilities WHERE agent=?",
+                (peer,),
+            ).fetchone()
+        advertised = json.loads(row["features"]) if row else None
+        if row and row["expires_at"] <= now and "wake" in advertised:
+            advertised.remove("wake")
+        return {
+            "peer": peer,
+            "features": advertised,
+            "wake_fresh_until": row["expires_at"] if row and "wake" in advertised else None,
+        }
+
+    def upload_attachment(self, agent: str, conversation_id: str, filename: str, data: bytes):
+        if not 0 < len(data) <= MAX_ATTACHMENT:
+            raise PigeonError("size", "Attachment must be between 1 byte and 1 MiB.")
+        now = time.time()
+        digest = hashlib.sha256(data).hexdigest()
+        attachment_id = str(uuid4())
+        expires = now + 3600
+        with self.transaction() as db:
+            peer = self.session_peer(db, agent, conversation_id)
+            row = db.execute(
+                "SELECT features FROM chat_capabilities WHERE agent=?",
+                (peer,),
+            ).fetchone()
+            if not row or "attachments" not in json.loads(row["features"]):
+                raise PigeonError("unsupported", "Peer attachment support is unavailable.")
+            db.execute("DELETE FROM attachments WHERE expires_at<=?", (now,))
+            count = db.execute(
+                "SELECT COUNT(*) AS n FROM attachments WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()["n"]
+            if count >= 8:
+                raise PigeonError("limit", "This session already has eight live attachments.")
+            if db.execute("SELECT COUNT(*) AS n FROM attachments").fetchone()["n"] >= 256:
+                raise PigeonError("limit", "Relay attachment storage is full. Try again later.")
+            db.execute(
+                "INSERT INTO attachments VALUES (?, ?, ?, ?, ?, ?)",
+                (attachment_id, conversation_id, filename, digest, expires, data),
+            )
+        return {"id": attachment_id, "filename": filename, "sha256": digest, "expires_at": expires}
+
+    def download_attachment(self, agent: str, conversation_id: str, attachment_id: str):
+        with self.transaction(write=False) as db:
+            self.session_peer(db, agent, conversation_id)
+            row = db.execute(
+                """SELECT digest, data FROM attachments
+                   WHERE id=? AND conversation_id=? AND expires_at>?""",
+                (attachment_id, conversation_id, time.time()),
+            ).fetchone()
+        if not row:
+            raise PigeonError("not_found", "Attachment not found.")
+        return row
+
+    def prune_attachments(self):
+        with self.transaction() as db:
+            db.execute("DELETE FROM attachments WHERE expires_at<=?", (time.time(),))
 
     def take(self, recipient: str) -> dict | None:
         now = time.time()
         with self.transaction() as db:
-            row = db.execute(TURN + QUEUED, (recipient, now)).fetchone()
+            row = db.execute(TURN + QUEUED + OLDEST, (recipient, now)).fetchone()
             if not row:
                 return None
             token = secrets.token_hex(8)

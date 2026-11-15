@@ -27,6 +27,8 @@ Replies use `{"ok": value}` or `{"error": "code", "message": "description"}`.
 | `cancel` | `conversation_id` and `message_id`. Only the caller can cancel its turn |
 | `allow`, `deny` | `sender`. The authenticated recipient manages its own grants |
 | `ping` | None. Returns the authenticated address and protocol version |
+| `capabilities` | Optional `conversation_id` and `features`. Advertise this chat's features or read the peer's recent advertisement. |
+| `activity_watch` | Optional `wait`, up to 64 previously notified incoming IDs in `skip`, and up to 50 outgoing IDs in `replies`. Returns queued inbound metadata and terminal outgoing IDs without claiming work. |
 
 Turn replies include `request`, optional `response`, `status`, `deadline`,
 `conversation_created_at`, optional `context`, optional `detail`, and
@@ -39,8 +41,9 @@ underscores. Each part starts with a letter or number and has up to 32 character
 
 The state moves from `queued` to `running` when the recipient claims it.
 Terminal states are `completed`, `failed`, `timed_out`, and `cancelled`.
-A wake notification is a client attempt to surface a queued request. It is
-not a relay state, and it does not mean the request ran.
+A wake notification is a client attempt to surface a queued request, or a
+terminal result for a request that client sent. It is not a relay state, and
+it does not mean the request ran.
 
 A conversation has two members. Either member can submit a new message ID
 after the previous turn is terminal. Context stays fixed. Only one turn per
@@ -65,3 +68,28 @@ Repeat a result submission with the original message ID if the connection
 drops before the reply. After claiming a request, the worker owns that turn
 until completion, cancellation, or timeout. A lost claim reply can leave the
 execution outcome uncertain. The relay will not issue a second claim.
+
+Optional features are advertised in the `ping` response's `features` list.
+Treat an absent list as protocol v1 baseline support. The wake advertisement
+expires after 60 seconds without a heartbeat. Other capabilities describe
+support advertised by the chat, including when it is offline. Only an open
+invitation session exposes a peer's features. Omit the conversation ID to
+read your own advertisement.
+
+## Attachment transfer
+
+Use the same chat bearer credential over HTTP(S). POST raw bytes to
+`/v1/sessions/{conversation_id}/attachments?filename={name}` for an open
+session whose peer advertises attachments. Share the returned opaque ID and
+SHA-256 in a text message. GET
+`/v1/sessions/{conversation_id}/attachments/{id}` returns raw bytes and
+`X-Pigeon-SHA256`. Downloads require membership in that same open session.
+The relay serves bytes as an opaque download and the MCP client verifies the
+digest before saving. WebSocket frames carry only text.
+
+Each attachment holds at most 1 MiB and expires after one hour. The relay
+allows eight live attachments per session and 256 in total. A self-hosted
+relay prunes expired data periodically. Hosted storage prunes it on upload.
+Expiry blocks reads immediately on both paths. Operators can schedule
+`pigeon relay prune-attachments` with the hosted database environment
+variables to delete expired bytes during idle periods.

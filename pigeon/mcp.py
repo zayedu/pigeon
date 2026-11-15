@@ -1,11 +1,12 @@
 import asyncio
 import os
+import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from functools import partial
 from pathlib import Path
 from typing import Annotated, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from mcp.server.fastmcp import Context as MCPContext
 from mcp.server.fastmcp import FastMCP
@@ -14,19 +15,25 @@ from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, Notification, TextContent
 from pydantic import Field
 
+from .attachments import download_file, upload_file
 from .client import ask_agent, open_client
 from .config import Config, chat_share
 from .models import (
+    ACTIVE,
+    MAX_TEXT,
     MAX_WAIT,
     Address,
     Cancel,
+    Capabilities,
     Close,
     Content,
     Context,
     Finish,
+    GitHubReference,
     Inspect,
     ListCalls,
     PigeonError,
+    Ping,
     Redeem,
     ShareKey,
     Take,
@@ -45,6 +52,14 @@ MISSING_CHAT = (
     "Pigeon cannot identify this chat, so it will not use your account. "
     "Reopen it with pigeon wake, or share from a Codex or Claude chat that exposes its session id."
 )
+
+
+def message_with_references(message: str, references: list[GitHubReference] | None) -> str:
+    if references:
+        message += "\n\nReferences:\n" + "\n".join(ref.url() for ref in references)
+        if len(message) > MAX_TEXT:
+            raise ToolError("The message and references must fit within 4,000 characters.")
+    return message
 
 
 class ClaudeWakeNotification(Notification[dict, Literal["notifications/claude/channel"]]):
@@ -68,10 +83,15 @@ def create_mcp(
     codex_wake: tuple[str, UUID, str] | None = None,
     claude_channel: bool = False,
     cursor_endpoint: str | None = None,
+    antigravity_session_file: Path | None = None,
     profile: Path | None = None,
 ) -> FastMCP:
-    shared: Config | None = None
     listeners: dict[str, asyncio.Task] = {}
+    wake_state: dict[str, dict] = {}
+    seen: set[str] = set()
+    inflight: set[str] = set()
+    waiting: dict[str, set[UUID]] = {}
+    relay_features: dict[str, list[str]] = {}
 
     @asynccontextmanager
     async def lifespan(_server):
@@ -103,6 +123,12 @@ def create_mcp(
             session_file = Path(cursor_endpoint).with_suffix(".session")
             if session_file.is_file():
                 chat_id = f"cursor:{session_file.read_text(encoding='utf-8').strip()}"
+        if antigravity_session_file is not None:
+            try:
+                session = antigravity_session_file.read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                return None
+            return f"antigravity:{session}" if session else None
         return chat_id
 
     async def list_sessions(actor: Config) -> list[dict]:
@@ -186,6 +212,22 @@ def create_mcp(
             )
         return actor, chosen[0], chosen[1]
 
+    async def ask_tracked(actor: Config, message: str, **kwargs) -> Turn:
+        message_id = uuid4()
+        key = str(message_id)
+        inflight.add(key)
+        try:
+            turn = await ask_agent(
+                actor.relay, actor.token, message, message_id=message_id, **kwargs
+            )
+            if turn.status not in ACTIVE:
+                seen.add(str(turn.request.id))
+            elif actor.agent in waiting:
+                waiting[actor.agent].add(turn.request.id)
+            return turn
+        finally:
+            inflight.discard(key)
+
     @server.tool()
     async def pigeon_ask(
         ctx: MCPContext,
@@ -193,6 +235,7 @@ def create_mcp(
         to: Address | None = None,
         context: Context | None = None,
         conversation_id: UUID | None = None,
+        references: Annotated[list[GitHubReference], Field(max_length=8)] | None = None,
     ) -> Turn:
         """Ask the other member of a session. Omit the address when this chat has one session."""
         try:
@@ -201,10 +244,9 @@ def create_mcp(
             )
             if peer is None:
                 raise ToolError("Say which session to use, or share a key and join first.")
-            return await ask_agent(
-                actor.relay,
-                actor.token,
-                message,
+            return await ask_tracked(
+                actor,
+                message_with_references(message, references),
                 to=peer,
                 context=context,
                 conversation_id=session_id,
@@ -214,7 +256,10 @@ def create_mcp(
 
     @server.tool()
     async def pigeon_reply(
-        ctx: MCPContext, message: Content, conversation_id: UUID | None = None
+        ctx: MCPContext,
+        message: Content,
+        conversation_id: UUID | None = None,
+        references: Annotated[list[GitHubReference], Field(max_length=8)] | None = None,
     ) -> Turn:
         """Ask a follow-up in a session this chat belongs to, in either direction."""
         try:
@@ -223,7 +268,9 @@ def create_mcp(
             )
             if session_id is None:
                 raise ToolError("No session in this chat matches that request.")
-            return await ask_agent(actor.relay, actor.token, message, conversation_id=session_id)
+            return await ask_tracked(
+                actor, message_with_references(message, references), conversation_id=session_id
+            )
         except PigeonError as exc:
             raise ToolError(str(exc)) from None
 
@@ -238,15 +285,26 @@ def create_mcp(
             if conversation_id is None:
                 actor = await resolve_actor(ctx)
                 sessions = await list_sessions(actor)
+                chat_id = chat_id_for(ctx) if not daemon else None
+                listener = listeners.get(chat_id)
                 return {
                     "summary": format_sessions(actor, sessions) or "This chat has no sessions.",
                     "sessions": sessions,
+                    "wake": {
+                        "attached": listener is not None and not listener.done(),
+                        **wake_state.get(chat_id, {}),
+                    },
                 }
             actor, session_id, _peer = await resolve_send(
                 ctx, conversation_id=conversation_id, peer=None, create=False
             )
             async with open_client(actor.relay, actor.token) as client:
-                return await client.turn(Inspect(conversation_id=session_id, message_id=message_id))
+                turn = await client.turn(Inspect(conversation_id=session_id, message_id=message_id))
+            if turn.request.sender == actor.agent and turn.status not in ACTIVE:
+                seen.add(str(turn.request.id))
+                if actor.agent in waiting:
+                    waiting[actor.agent].discard(turn.request.id)
+            return turn
         except PigeonError as exc:
             raise ToolError(str(exc)) from None
 
@@ -293,28 +351,87 @@ def create_mcp(
         share_lock = asyncio.Lock()
         identities: dict[str, object] = {}
         inboxes: dict[str, Config] = {}
+        capability_refresh: dict[str, float] = {}
+
+        @server.tool()
+        async def pigeon_capabilities(ctx: MCPContext, conversation_id: UUID) -> dict:
+            """Check relay features and the peer's last advertised session capabilities."""
+            try:
+                actor = await ensure_chat(ctx, create=False)
+                features = relay_features.get(actor.agent, [])
+                result = {"relay": features, "peer": None}
+                if "peer_capabilities" in features:
+                    async with open_client(actor.relay, actor.token) as client:
+                        result["peer"] = await client.call(
+                            Capabilities(conversation_id=conversation_id)
+                        )
+                return result
+            except PigeonError as exc:
+                raise ToolError(str(exc)) from None
+
+        @server.tool()
+        async def pigeon_upload(ctx: MCPContext, conversation_id: UUID, path: str) -> dict:
+            """Upload a file the user authorized. Send the returned reference in this session."""
+            try:
+                actor = await ensure_chat(ctx, create=False)
+                if "attachments" not in relay_features.get(actor.agent, []):
+                    raise PigeonError("unsupported", "This relay does not support attachments.")
+                return await asyncio.to_thread(
+                    upload_file, actor, conversation_id, Path(path).expanduser()
+                )
+            except PigeonError as exc:
+                raise ToolError(str(exc)) from None
+
+        @server.tool()
+        async def pigeon_download(
+            ctx: MCPContext,
+            conversation_id: UUID,
+            attachment_id: UUID,
+            destination: str,
+            sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")] | None = None,
+        ) -> dict:
+            """Save an attachment the user authorized to a new local file."""
+            try:
+                actor = await ensure_chat(ctx, create=False)
+                return await asyncio.to_thread(
+                    download_file,
+                    actor,
+                    conversation_id,
+                    attachment_id,
+                    Path(destination).expanduser(),
+                    sha256,
+                )
+            except PigeonError as exc:
+                raise ToolError(str(exc)) from None
 
         async def open_inbox(ctx: MCPContext, *, resume: bool = False):
-            nonlocal shared
             async with share_lock:
                 chat_id = chat_id_for(ctx)
                 if chat_id is None:
                     raise PigeonError("not_found", MISSING_CHAT)
-                if resume and chat_id in inboxes:
-                    shared = inboxes[chat_id]
-                    return shared
-                identity = identities.get(chat_id)
-                if identity is None:
-                    identity = chat_share(profile, config, chat_id)
-                    identities[chat_id] = identity
+                inbox = inboxes.get(chat_id)
+                if not resume or inbox is None:
+                    identity = identities.get(chat_id)
+                    if identity is None:
+                        identity = chat_share(profile, config, chat_id)
+                        identities[chat_id] = identity
+                    async with open_client(config.relay, config.token) as client:
+                        result = await client.call(identity.model_copy(update={"resume": resume}))
+                    inbox = Config(
+                        relay=config.relay, agent=result["address"], token=result["token"]
+                    )
+                    inboxes[chat_id] = inbox
+                current = listeners.get(chat_id)
+                if current is not None and not current.done():
+                    return inbox if resume else (result, True)
+                if current is not None:
+                    listeners.pop(chat_id)
+                    if not current.cancelled():
+                        current.exception()
                 codex = None
                 meta = ctx.request_context.meta
                 if meta:
                     codex = meta.model_dump().get("x-codex-turn-metadata")
-                async with open_client(config.relay, config.token) as client:
-                    result = await client.call(identity.model_copy(update={"resume": resume}))
-                shared = Config(relay=config.relay, agent=result["address"], token=result["token"])
-                inboxes[chat_id] = shared
                 notify = None
                 if codex_wake is not None:
                     notify = partial(queue_codex, *codex_wake)
@@ -325,20 +442,42 @@ def create_mcp(
                         ctx.session.send_notification,
                         ClaudeWakeNotification(params={"content": WAKE_PROMPT}),
                     )
+                elif antigravity_session_file is not None:
+                    pass
                 elif isinstance(codex, dict):
                     notify = await native_codex_wake(codex)
                 else:
                     notify = native_claude_wake()
-                current = listeners.get(chat_id)
-                if current is not None:
-                    current.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await current
-                    listeners.pop(chat_id, None)
+                advertised = ["attachments", "websocket", "manual_inbox"]
                 if notify is not None:
-                    listeners[chat_id] = asyncio.create_task(listen(shared, notify))
+                    advertised.append("wake")
+                features = relay_features.get(inbox.agent, [])
+                if notify is not None or time.monotonic() >= capability_refresh.get(inbox.agent, 0):
+                    capability_refresh[inbox.agent] = time.monotonic() + 30
+                    try:
+                        async with open_client(inbox.relay, inbox.token) as client:
+                            features = (await client.call(Ping())).get("features", [])
+                            relay_features[inbox.agent] = features
+                            if "peer_capabilities" in features:
+                                await client.call(Capabilities(features=advertised))
+                    except PigeonError:
+                        # An optional advertisement must not block ordinary messages.
+                        pass
+                if notify is not None:
+                    listeners[chat_id] = asyncio.create_task(
+                        listen(
+                            inbox,
+                            notify,
+                            seen=seen,
+                            inflight=inflight,
+                            diagnostics=wake_state.setdefault(chat_id, {}),
+                            waiting=waiting.setdefault(inbox.agent, set()),
+                            features=features,
+                            advertised=advertised,
+                        )
+                    )
                 if resume:
-                    return shared
+                    return inbox
                 return result, chat_id in listeners
 
         async def ensure_chat(ctx: MCPContext, *, create: bool) -> Config:
@@ -375,7 +514,7 @@ def create_mcp(
 
         register_session_tools(
             server,
-            lambda: shared,
+            lambda: None,
             restore=partial(open_inbox, resume=True),
             chat_of=chat_id_for,
         )

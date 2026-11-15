@@ -12,11 +12,14 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosedError
 
 from pigeon.client import open_client, relay_endpoint
+from pigeon.config import Config
 from pigeon.models import (
     MAX_FRAME,
+    ActivityWatch,
     Close,
     Context,
     Finish,
+    GitHubReference,
     Grant,
     Inspect,
     PigeonError,
@@ -28,6 +31,7 @@ from pigeon.models import (
     Watch,
     command,
 )
+from pigeon.wake import listen
 
 
 def test_protocol_validation():
@@ -56,6 +60,80 @@ def test_protocol_validation():
             command.validate_python(data | changes)
     with pytest.raises(PigeonError):
         relay_endpoint("ws://example.com")
+
+
+def test_github_references_use_pinned_and_escaped_urls():
+    sha = "a" * 40
+    assert (
+        GitHubReference(
+            kind="file", repo="alice/project", commit=sha, path="docs/My file #1.md"
+        ).url()
+        == f"https://github.com/alice/project/blob/{sha}/docs/My%20file%20%231.md"
+    )
+    assert (
+        GitHubReference(kind="diff", repo="alice/project", pr=12).url().endswith("/pull/12/files")
+    )
+    with pytest.raises(PigeonError):
+        GitHubReference(kind="file", repo="alice/..", commit=sha, path="file.txt").url()
+    with pytest.raises(PigeonError):
+        GitHubReference(kind="file", repo="alice/project", commit=sha, path="../file").url()
+
+
+def test_activity_watch_skips_notified_requests_and_hides_other_senders(relay):
+    async def exchange():
+        async with (
+            open_client(relay.url, relay.alice) as alice,
+            open_client(relay.url, relay.bob) as bob,
+        ):
+            await alice.call(Grant(op="allow", sender=BOB))
+            first = await bob.ask(ALICE, "One", wait=0)
+            second = await bob.ask(ALICE, "Two", wait=0)
+            one, two = first.request.id, second.request.id
+            assert (await alice.call(ActivityWatch(wait=0)))["incoming"]["id"] == str(one)
+            found = await alice.call(ActivityWatch(wait=0, skip=[one]))
+            assert found["incoming"]["id"] == str(two)
+            assert await alice.call(ActivityWatch(wait=0, skip=[one, two])) is None
+            await alice.call(Take(wait=0))
+            await alice.call(Finish(message_id=one, status="completed", content="Done"))
+            assert await alice.call(ActivityWatch(wait=0, skip=[two], replies=[one])) is None
+            assert (await bob.call(ActivityWatch(wait=0, replies=[one])))["replies"] == [
+                {"id": str(one), "conversation_id": str(first.request.conversation_id)}
+            ]
+
+    asyncio.run(exchange())
+
+
+def test_activity_listener_wakes_sender_for_terminal_reply(relay):
+    async def exchange():
+        async with (
+            asyncio.timeout(8),
+            open_client(relay.url, relay.alice) as alice,
+            open_client(relay.url, relay.bob) as bob,
+        ):
+            await alice.call(Grant(op="allow", sender=BOB))
+            turn = await bob.ask(ALICE, "One", wait=0)
+            waiting = {turn.request.id}
+            notified = asyncio.Event()
+
+            async def notify():
+                notified.set()
+
+            config = Config(relay=relay.url, agent=BOB, token=relay.bob)
+            task = asyncio.create_task(
+                listen(config, notify, waiting=waiting, features=["activity_watch"])
+            )
+            try:
+                await alice.call(Take(wait=0))
+                await alice.call(
+                    Finish(message_id=turn.request.id, status="completed", content="Yes")
+                )
+                await notified.wait()
+                assert not waiting
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exchange())
 
 
 def test_two_client_processes_exchange_messages(relay):

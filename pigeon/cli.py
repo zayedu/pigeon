@@ -27,6 +27,7 @@ from .client import ask_agent, open_client, relay_endpoint
 from .config import (
     Config,
     Exposure,
+    chat_share,
     config_lock,
     default_config,
     load,
@@ -39,7 +40,9 @@ from .config import (
 from .daemon import Daemon, Echo, Sessions
 from .db import open_store
 from .models import (
+    ACTIVE,
     Cancel,
+    Capabilities,
     Close,
     Command,
     Context,
@@ -60,6 +63,16 @@ app.add_typer(relay_app, name="relay")
 Database = Annotated[Path, typer.Option("--db", help="Relay SQLite database.")]
 Wait = Annotated[int, typer.Option(min=0, max=60, help="Seconds to wait for a response.")]
 HOSTED_RELAY = "wss://pigeon-relay-rust.vercel.app"
+# Hashes of stock skills shipped before installations recorded their own digest.
+LEGACY_SKILL_DIGESTS = {
+    "1c938188b9e398f1085f5de06fa7cfbea3816a9f7f93c3b36b91eec8573c6e08",
+    "e03db3e0cee16f0d9fd2dc5d13aef9e17c5a49fcc8651fdf2b559175e9ac62f2",
+    "ef67a83b600adbd2fb8bb38dea5a41c9ed76c2b836c6efafc99bbed6a9cb5b9c",
+    "abfaa727f3394f3d9ad2eda78456be8b6efae6c5a0ee56c44f593093e516a15f",
+    "5698da69ea03528b35d27ebf8a2f6cd4efdf63c43553e84c4bb9db35a31f0112",
+    "71944c1499c5d43a37c6bb40c5d2f73a055dd8ce56d51ab73ec3448c088ecf2c",
+    "b6b27eb586b91d965809e035bf5f758c2d60dadd1e196b8e9861b1eed2d72887",
+}
 
 
 @app.command()
@@ -71,6 +84,9 @@ def update():
     result = subprocess.run(
         [uv, "tool", "install", "--reinstall", "git+https://github.com/zayedu/pigeon.git"],
     )
+    if result.returncode:
+        raise typer.Exit(result.returncode)
+    result = subprocess.run([sys.executable, "-I", "-m", "pigeon.cli", "refresh-skills"])
     if result.returncode:
         raise typer.Exit(result.returncode)
     typer.echo("Reopen your agent to load the update.")
@@ -131,9 +147,26 @@ def revoke_token(agent: str, db: Annotated[Path | None, typer.Option("--db")] = 
     typer.echo(f"Revoked {agent}.")
 
 
+@relay_app.command("prune-attachments")
+def prune_attachments(db: Annotated[Path | None, typer.Option("--db")] = None):
+    """Delete expired attachment bytes from a local or configured hosted database."""
+    open_store(db).prune_attachments()
+
+
 async def rpc(config: Config, command: Command):
     async with open_client(config.relay, config.token) as client:
         return await client.call(command)
+
+
+def inspect_profile(path: Path, chat: str | None) -> Config:
+    config = load(path)
+    if chat is None:
+        return config
+    if chat.partition(":")[0] not in {"codex", "claude", "cursor", "antigravity"}:
+        raise PigeonError("chat_id", "Use a chat ID such as codex:<thread-id>.")
+    identity = chat_share(path, config, chat, existing_only=True)
+    result = asyncio.run(rpc(config, identity.model_copy(update={"resume": True})))
+    return Config(relay=config.relay, agent=result["address"], token=result["token"])
 
 
 def show(value):
@@ -188,13 +221,14 @@ def connect_profile(path: Path, url: str, token: str, *, session_profile: bool =
 @app.command()
 def setup(
     ctx: typer.Context,
-    client: Literal["codex", "claude", "cursor"],
+    client: Literal["codex", "claude", "cursor", "antigravity"],
     username: str | None = None,
     relay: str = HOSTED_RELAY,
 ):
     """Create your Pigeon account and register it with your coding agent."""
-    if client != "cursor" and not shutil.which(client):
-        raise PigeonError("client_missing", f"Install {client} and put it on your PATH.")
+    binary = "agy" if client == "antigravity" else client
+    if client != "cursor" and not shutil.which(binary):
+        raise PigeonError("client_missing", f"Install {binary} and put it on your PATH.")
     ctx.obj = setup_profile(ctx, relay)
     with config_lock(ctx.obj):
         if not ctx.obj.exists():
@@ -227,19 +261,66 @@ def setup(
         else:
             username = load(ctx.obj).agent.removeprefix("@").split("/", 1)[0]
             typer.echo(f"Using your Pigeon account @{username}.")
-    register_mcp(ctx.obj, client, "user", name="pigeon-relay")
+    if client == "antigravity":
+        typer.echo("Run pigeon antigravity to open a chat with Pigeon.")
+    else:
+        register_mcp(ctx.obj, client, "user", name="pigeon-relay")
     install_skill(client)
 
 
-def install_skill(client: str):
+def skill_path(client: str) -> Path:
     skill_root = Path.home() / ".agents"
     if client == "claude":
         skill_root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
-    path = skill_root / "skills" / "pigeon" / "SKILL.md"
+    elif client == "antigravity":
+        skill_root = Path.home() / ".gemini" / "antigravity-cli"
+    return skill_root / "skills" / "pigeon" / "SKILL.md"
+
+
+def install_skill(client: str, *, existing_only: bool = False):
+    path = skill_path(client)
+    if existing_only and not path.is_file():
+        return
+    content = files("pigeon").joinpath("skills/pigeon/SKILL.md").read_bytes()
+    digest = hashlib.sha256(content).hexdigest()
+    stamp = path.with_name(".pigeon-skill.sha256")
     with config_lock(path):
-        if not path.exists():
-            content = files("pigeon").joinpath("skills/pigeon/SKILL.md").read_text(encoding="utf-8")
-            path.write_text(content, encoding="utf-8")
+        if path.exists():
+            current = hashlib.sha256(path.read_bytes()).hexdigest()
+            previous = stamp.read_text(encoding="utf-8").strip() if stamp.exists() else None
+            if current not in LEGACY_SKILL_DIGESTS and current not in (digest, previous):
+                typer.echo(f"Kept your edited Pigeon skill at {path}.")
+                return
+        if not path.exists() or current != digest:
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+                temporary = Path(handle.name)
+                try:
+                    handle.write(content)
+                    handle.flush()
+                    temporary.replace(path)
+                finally:
+                    temporary.unlink(missing_ok=True)
+        stamp.write_text(digest + "\n", encoding="utf-8")
+
+
+@app.command(hidden=True)
+def refresh_skills():
+    """Refresh previously installed skills from this version."""
+    for client in ("codex", "claude", "antigravity"):
+        install_skill(client, existing_only=True)
+
+
+@app.command()
+def antigravity(ctx: typer.Context, session_id: Annotated[str | None, typer.Argument()] = None):
+    """Open an Antigravity CLI chat with Pigeon registered for that chat."""
+    from .acp import run_acp
+
+    ctx.obj = setup_profile(ctx)
+    load(ctx.obj)
+    binary = shutil.which("agy")
+    if not binary:
+        raise PigeonError("client_missing", "Install Antigravity CLI and sign in with agy.")
+    asyncio.run(run_acp(binary, ctx.obj, session_id, antigravity=True))
 
 
 @app.command()
@@ -277,12 +358,12 @@ def wake(
     ctx.obj = setup_profile(ctx)
     load(ctx.obj)
     if client_or_thread == "cursor":
-        from .cursor_acp import run_cursor
+        from .acp import run_acp
 
         binary = shutil.which("agent") or shutil.which("cursor-agent")
         if not binary:
             raise PigeonError("client_missing", "Install and sign in to Cursor CLI first.")
-        asyncio.run(run_cursor(binary, ctx.obj, session_id))
+        asyncio.run(run_acp(binary, ctx.obj, session_id))
         return
     if client_or_thread == "claude":
         binary = shutil.which("claude")
@@ -591,6 +672,8 @@ def status(
     ctx: typer.Context,
     conversation_id: UUID | None = None,
     message_id: UUID | None = None,
+    chat: Annotated[str | None, typer.Option(help="Local chat ID, e.g. codex:<thread-id>.")] = None,
+    pending: Annotated[bool, typer.Option(help="List only pending requests.")] = False,
 ):
     """List recent conversations or inspect one conversation."""
     if message_id and not conversation_id:
@@ -600,7 +683,10 @@ def status(
         if conversation_id
         else (ListCalls())
     )
-    show(asyncio.run(rpc(load(ctx.obj), query)))
+    if pending and conversation_id:
+        raise PigeonError("invalid_option", "Use --pending without a conversation ID.")
+    result = asyncio.run(rpc(inspect_profile(setup_profile(ctx), chat), query))
+    show([row for row in result if row["status"] in ACTIVE] if pending else result)
 
 
 @app.command()
@@ -621,13 +707,38 @@ def close(ctx: typer.Context, conversation_id: UUID):
 
 
 @app.command()
-def doctor(ctx: typer.Context):
+def doctor(ctx: typer.Context, chat: str | None = None):
     """Check local configuration, relay access and runtime prerequisites."""
-    config = load(ctx.obj)
+    ctx.obj = setup_profile(ctx)
+    config = inspect_profile(ctx.obj, chat)
     remote = asyncio.run(rpc(config, Ping()))
     if remote["agent"] != config.agent:
         raise PigeonError("wrong_identity", "Relay credential belongs to a different agent.")
     typer.echo(f"Relay protocol {remote['protocol']} authenticated {config.agent}.")
+    typer.echo(f"Relay features: {', '.join(remote.get('features', [])) or 'baseline only'}.")
+    if chat:
+        if "peer_capabilities" in remote.get("features", []):
+            result = asyncio.run(rpc(config, Capabilities()))
+            features = ", ".join(result["features"] or [])
+            typer.echo(f"Chat capabilities: {features or 'unavailable'}.")
+            if result["features"] is not None:
+                mode = "listener advertised" if "wake" in result["features"] else "manual inbox"
+                typer.echo(f"Wake mode: {mode}.")
+        typer.echo("Run pigeon_status in the open chat for live wake diagnostics.")
+        return
+    integrations = [
+        label
+        for command, label in (
+            ("codex", "Codex"),
+            ("claude", "Claude Code"),
+            ("cursor-agent", "Cursor"),
+            ("agy", "Antigravity"),
+        )
+        if shutil.which(command)
+    ]
+    typer.echo(f"Agent executables on PATH: {', '.join(integrations) or 'none'}.")
+    installed = [host for host in ("codex", "claude", "antigravity") if skill_path(host).is_file()]
+    typer.echo(f"Pigeon skills installed for: {', '.join(installed) or 'none'}.")
     daemon_status(ctx)
     exposure = config.exposure
     if exposure and exposure.workspace:
@@ -653,6 +764,7 @@ def mcp_server(
     codex_endpoint: str | None = None,
     claude_channel: bool = False,
     cursor_endpoint: str | None = None,
+    antigravity_session_file: Path | None = None,
 ):
     """Run the local stdio MCP server."""
     from contextlib import ExitStack
@@ -661,7 +773,12 @@ def mcp_server(
 
     config = load(ctx.obj)
     wake_options = (codex_bin, codex_thread, codex_endpoint)
-    targets = (any(wake_options), claude_channel, cursor_endpoint is not None)
+    targets = (
+        any(wake_options),
+        claude_channel,
+        cursor_endpoint is not None,
+        antigravity_session_file is not None,
+    )
     if (any(wake_options) and not all(wake_options)) or sum(targets) + session > 1:
         raise PigeonError("wake_config", "Use pigeon wake to launch automatic delivery.")
     with ExitStack() as stack:
@@ -679,6 +796,7 @@ def mcp_server(
             else None,
             claude_channel=claude_channel,
             cursor_endpoint=cursor_endpoint,
+            antigravity_session_file=antigravity_session_file,
             profile=ctx.obj,
         ).run(transport="stdio")
 

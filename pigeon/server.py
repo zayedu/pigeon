@@ -5,17 +5,23 @@ from collections import Counter
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from time import monotonic
+from uuid import UUID
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response
 from pydantic import ValidationError
 
 from .client import is_loopback
 from .db import open_store, token_hash
 from .models import (
     ACTIVE,
+    MAX_ATTACHMENT,
     MAX_FRAME,
+    RELAY_FEATURES,
+    ActivityWatch,
     Cancel,
+    Capabilities,
     Close,
     Command,
     Finish,
@@ -56,18 +62,28 @@ def create_app(path: Path | None) -> FastAPI:
             # Also recheck credentials and state changed by local admin commands.
             notify()
 
+    async def prune():
+        while True:
+            await asyncio.sleep(60)
+            with suppress(sqlite3.OperationalError):
+                await storage(store.prune_attachments)
+
     @asynccontextmanager
     async def lifespan(_app):
         if shared:
             yield
             return
         task = asyncio.create_task(sweep())
+        cleanup = asyncio.create_task(prune())
         try:
             yield
         finally:
             task.cancel()
+            cleanup.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+            with suppress(asyncio.CancelledError):
+                await cleanup
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -102,8 +118,62 @@ def create_app(path: Path | None) -> FastAPI:
             return await asyncio.to_thread(operation, *args)
         return operation(*args)
 
+    async def http_agent(request: Request) -> str:
+        scheme, _, token = request.headers.get("authorization", "").partition(" ")
+        if scheme.lower() != "bearer" or not token.isascii() or len(token) != 43:
+            raise HTTPException(401, "Missing relay credential.")
+        agent = await storage(store.authenticate, token_hash(token))
+        if agent is None:
+            raise HTTPException(401, "Invalid relay credential.")
+        try:
+            rate_limit(agent)
+        except PigeonError as exc:
+            raise HTTPException(429, str(exc)) from None
+        return agent
+
+    @app.post("/v1/sessions/{conversation_id}/attachments", status_code=201)
+    async def upload(request: Request, conversation_id: UUID, filename: str):
+        agent = await http_agent(request)
+        if (
+            not 0 < len(filename) <= 120
+            or filename in {".", ".."}
+            or any(char in "/\\" or not char.isprintable() for char in filename)
+        ):
+            raise HTTPException(400, "Use a plain filename of at most 120 characters.")
+        data = bytearray()
+        async for chunk in request.stream():
+            if len(data) + len(chunk) > MAX_ATTACHMENT:
+                raise HTTPException(413, "Attachment exceeds 1 MiB.")
+            data.extend(chunk)
+        try:
+            return await storage(
+                store.upload_attachment, agent, str(conversation_id), filename, bytes(data)
+            )
+        except PigeonError as exc:
+            code = {"not_found": 404, "unsupported": 409, "limit": 429}.get(exc.code, 400)
+            raise HTTPException(code, str(exc)) from None
+
+    @app.get("/v1/sessions/{conversation_id}/attachments/{attachment_id}")
+    async def download(request: Request, conversation_id: UUID, attachment_id: UUID):
+        agent = await http_agent(request)
+        try:
+            row = await storage(
+                store.download_attachment, agent, str(conversation_id), str(attachment_id)
+            )
+        except PigeonError:
+            raise HTTPException(404, "Attachment not found.") from None
+        return Response(
+            bytes(row["data"]),
+            media_type="application/octet-stream",
+            headers={
+                "X-Pigeon-SHA256": row["digest"],
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     async def dispatch(agent: str, digest: str, frame: Command):
-        if isinstance(frame, (Inspect, Take, Watch)):
+        if isinstance(frame, (Inspect, Take, Watch, ActivityWatch)):
             until = monotonic() + frame.wait
             while True:
                 if await storage(store.authenticate, digest) != agent:
@@ -114,6 +184,12 @@ def create_app(path: Path | None) -> FastAPI:
                         await storage(store.expire)
                     result = await storage(store.inspect, agent, frame)
                     if result["status"] != frame.after or result["status"] not in ACTIVE:
+                        return result
+                elif isinstance(frame, ActivityWatch):
+                    if shared and frame.replies:
+                        await storage(store.expire)
+                    result = await storage(store.watch_activity, agent, frame)
+                    if result:
                         return result
                 else:
                     operation = store.next_message if isinstance(frame, Watch) else store.take
@@ -145,6 +221,9 @@ def create_app(path: Path | None) -> FastAPI:
                 if shared:
                     await storage(store.expire)
                 return await storage(store.list_calls, agent)
+            case Capabilities():
+                conversation_id = str(frame.conversation_id) if frame.conversation_id else None
+                return await storage(store.capabilities, agent, conversation_id, frame.features)
             case Share():
                 return await storage(
                     store.share, agent, frame.session_id, frame.session_token, frame.resume
@@ -152,7 +231,7 @@ def create_app(path: Path | None) -> FastAPI:
             case Redeem():
                 return await storage(store.redeem, agent, frame.key, frame.peer_session)
             case Ping():
-                return {"agent": agent, "protocol": 1}
+                return {"agent": agent, "protocol": 1, "features": RELAY_FEATURES}
         notify()
         return result
 
