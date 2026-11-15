@@ -7,7 +7,7 @@ import sys
 import tempfile
 from pathlib import Path
 from stat import S_IMODE
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from conftest import ALICE, BOB
@@ -82,6 +82,57 @@ def test_failed_wake_leaves_the_request_queued(relay):
     asyncio.run(exchange())
 
 
+@pytest.mark.parametrize("claim", [False, True])
+def test_scoped_wake_retries_dropped_notifications_with_a_budget(relay, monkeypatch, claim):
+    monkeypatch.setattr("pigeon.wake.ACTIVITY_WAIT", 1)
+    monkeypatch.setattr("pigeon.wake.WAKE_RETRY_DELAYS", (0.05, 0.1))
+
+    async def exchange():
+        token = secrets.token_urlsafe(32)
+        async with (
+            asyncio.timeout(8),
+            open_client(relay.url, relay.alice) as owner,
+            open_client(relay.url, relay.bob) as peer,
+        ):
+            shared = await owner.call(Share(session_id=uuid4(), session_token=token))
+            joined = await peer.call(Redeem(key=shared["key"], peer_session=True))
+            await peer.ask(
+                shared["address"], "wake", conversation_id=UUID(joined["conversation_id"]), wait=0
+            )
+            config = Config(relay=relay.url, token=token, agent=shared["address"])
+            notifications = asyncio.Queue()
+            attempts = {}
+
+            async def notify():
+                notifications.put_nowait(asyncio.get_running_loop().time())
+
+            def start():
+                return asyncio.create_task(
+                    listen(config, notify, features=["activity_watch"], attempts=attempts)
+                )
+
+            watcher = start()
+            try:
+                first = await notifications.get()
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+                watcher = start()
+                second = await notifications.get()
+                assert second - first >= 0.05
+                if claim:
+                    async with open_client(relay.url, token) as receiver:
+                        assert (await receiver.call(Take(wait=0)))["status"] == "running"
+                else:
+                    assert await notifications.get() - second >= 0.1
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(notifications.get(), 1.2)
+            finally:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+
+    asyncio.run(exchange())
+
+
 def test_cli_daemon_and_stdio_mcp(relay, tmp_path):
     alice, bob = (tmp_path / name for name in ("alice.json", "bob.json"))
     run_cli(alice, "login", relay.url, "--token-stdin", token=relay.alice)
@@ -117,6 +168,23 @@ def test_cli_daemon_and_stdio_mcp(relay, tmp_path):
             refused = await mcp.call_tool("pigeon_ask", {"to": ALICE, "message": "Why cache?"})
             assert refused.isError
             assert "cannot identify this chat" in refused.content[0].text
+            source = tmp_path / "private.txt"
+            source.write_text("synthetic private content")
+            rejected = await mcp.call_tool(
+                "pigeon_upload", {"conversation_id": str(uuid4()), "path": str(source)}
+            )
+            assert rejected.isError and "local user must run" in rejected.content[0].text
+            assert "synthetic private content" not in rejected.content[0].text
+            target = tmp_path / "injected.txt"
+            rejected = await mcp.call_tool(
+                "pigeon_download",
+                {
+                    "conversation_id": str(uuid4()),
+                    "attachment_id": str(uuid4()),
+                    "destination": str(target),
+                },
+            )
+            assert rejected.isError and not target.exists()
 
             async with open_client(relay.url, relay.bob) as caller:
                 first = await caller.ask(
@@ -468,6 +536,7 @@ def test_shared_chat_wakes_without_calling_receive(relay, tmp_path):
         ):
             await owner.initialize()
             share = await owner.call_tool("pigeon_share", {})
+            assert share.structuredContent["wake"]["attached"] is True
             target = await reviewer.call(
                 Redeem(key=share.structuredContent["result"], peer_session=True)
             )

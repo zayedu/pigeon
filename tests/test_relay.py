@@ -99,6 +99,10 @@ def test_activity_watch_skips_notified_requests_and_hides_other_senders(relay):
             assert (await bob.call(ActivityWatch(wait=0, replies=[one])))["replies"] == [
                 {"id": str(one), "conversation_id": str(first.request.conversation_id)}
             ]
+            relay.store.enroll(ALICE, rotate=True)
+            with pytest.raises(PigeonError) as revoked:
+                await alice.call(ActivityWatch(wait=0))
+            assert revoked.value.code == "unauthenticated"
 
     asyncio.run(exchange())
 

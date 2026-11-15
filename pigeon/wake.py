@@ -28,6 +28,8 @@ WAKE_PROMPT = (
 )
 TERMINAL = frozenset({"completed", "failed", "cancelled", "timed_out"})
 REPLY_POLL = 2
+ACTIVITY_WAIT = 5
+WAKE_RETRY_DELAYS = (5, 15)
 
 
 async def native_codex_wake(metadata: object) -> Callable[[], Awaitable[None]] | None:
@@ -192,9 +194,9 @@ async def listen(
     waiting: set[UUID] | None = None,
     features: list[str] | None = None,
     advertised: list[str] | None = None,
+    attempts: dict[str, tuple[int, float, float]] | None = None,
 ):
-    notified = None
-    notified_ids: dict[UUID, float] = {}
+    attempts = attempts if attempts is not None else {}
     delay = 1
     primed = False
     seen = seen if seen is not None else set()
@@ -220,13 +222,20 @@ async def listen(
                     if advertised and time.monotonic() - last_advertised >= 30:
                         await client.call(Capabilities(features=advertised))
                         last_advertised = time.monotonic()
+                    now = time.time()
+                    for key, (_, _, deadline) in list(attempts.items()):
+                        if now >= deadline:
+                            del attempts[key]
                     if activity_watch:
-                        now = time.time()
-                        notified_ids = {key: end for key, end in notified_ids.items() if end > now}
+                        skip = [
+                            key
+                            for key, (count, next_at, _) in attempts.items()
+                            if count > len(WAKE_RETRY_DELAYS) or next_at > now
+                        ]
                         result = await client.call(
                             ActivityWatch(
-                                wait=5,
-                                skip=list(notified_ids)[-64:],
+                                wait=ACTIVITY_WAIT,
+                                skip=skip[-64:],
                                 replies=[
                                     item for item in sorted(waiting) if str(item) not in inflight
                                 ][:50],
@@ -249,11 +258,26 @@ async def listen(
                         replies = await _ready_replies(client, config, seen, inflight)
                     diagnostics["last_relay_check_at"] = time.time()
                     diagnostics.pop("retrying", None)
-                    inbound = incoming is not None and incoming != notified
+                    count, next_at, _ = attempts.get(incoming, (0, 0, 0))
+                    inbound = (
+                        incoming is not None
+                        and count <= len(WAKE_RETRY_DELAYS)
+                        and time.time() >= next_at
+                        and time.time() < pending["deadline"]
+                    )
                     if inbound or replies:
+                        if inbound:
+                            wait = WAKE_RETRY_DELAYS[count] if count < len(WAKE_RETRY_DELAYS) else 0
+                            attempts[incoming] = (
+                                count + 1,
+                                time.time() + wait,
+                                pending["deadline"],
+                            )
                         diagnostics["last_notification"] = {
                             "at": time.time(),
                             "state": "attempting",
+                            "request_id": incoming if inbound else None,
+                            "attempt": count + 1 if inbound else None,
                         }
                         try:
                             await notify()
@@ -261,14 +285,10 @@ async def listen(
                             diagnostics["last_notification"]["state"] = "failed"
                             raise
                         diagnostics["last_notification"]["state"] = "sent"
-                        if inbound:
-                            notified = incoming
-                            if activity_watch:
-                                notified_ids[UUID(incoming)] = result["incoming"]["deadline"]
                         seen.update(replies)
                         waiting.difference_update(UUID(item) for item in replies)
                     delay = 1
-                    if not activity_watch and incoming is not None:
+                    if incoming is not None and (not activity_watch or not inbound):
                         # Wait for the chat to claim the message before checking again.
                         await asyncio.sleep(2)
         except (PigeonError, OSError, TimeoutError) as exc:

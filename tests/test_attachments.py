@@ -1,4 +1,10 @@
 import asyncio
+import json
+import os
+import pty
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from uuid import UUID, uuid4
 
@@ -6,7 +12,7 @@ import pytest
 
 from pigeon.attachments import download_file, transfer, upload_file
 from pigeon.client import open_client
-from pigeon.config import Config
+from pigeon.config import Config, chat_share, save
 from pigeon.models import MAX_ATTACHMENT, Capabilities, Close, PigeonError, Redeem, Share
 
 
@@ -71,6 +77,7 @@ def test_attachment_round_trip_is_scoped_to_an_open_session(relay, tmp_path):
     relay.store.prune_attachments()
     with relay.store.transaction(write=False) as db:
         assert db.execute("SELECT COUNT(*) FROM attachments").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM attachment_uploaders").fetchone()[0] == 0
 
     live = upload_file(owner, conversation, source)
 
@@ -103,3 +110,137 @@ def test_libsql_attachment_bytes_are_preserved(tmp_path, monkeypatch):
     downloaded = store.download_attachment("@bob/agent", session, record["id"])
     assert bytes(downloaded["data"]) == data
     assert downloaded["digest"] == record["sha256"]
+
+
+def test_same_account_byte_quota_is_atomic_across_chats(identities, monkeypatch):
+    store, _, _ = identities
+    monkeypatch.setattr("pigeon.db.MAX_ATTACHMENT", 16)
+    store.capabilities("@bob/claude", None, ["attachments"])
+
+    def session():
+        shared = store.share("@alice/codex", uuid4(), "x" * 42 + str(len(inboxes)))
+        inboxes.append(shared["address"])
+        joined = store.redeem("@bob/claude", shared["key"], True)
+        return shared["address"], joined["conversation_id"]
+
+    inboxes = []
+    for count in (8, 7):
+        actor, conversation = session()
+        for _ in range(count):
+            store.upload_attachment(actor, conversation, "first.txt", b"x" * 16)
+    pairs = [session(), session()]
+
+    def upload(pair):
+        try:
+            store.upload_attachment(*pair, "concurrent.txt", b"x" * 16)
+        except PigeonError as exc:
+            assert exc.code == "limit" and "account" in str(exc)
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(upload, pairs)) == [False, True]
+    # A separate uploader account still has capacity in the same session.
+    actor, conversation = pairs[0]
+    store.capabilities(actor, None, ["attachments"])
+    store.upload_attachment("@bob/claude", conversation, "reply.txt", b"x" * 16)
+
+
+def test_attachment_cli_refuses_piped_confirmation(tmp_path):
+    source = tmp_path / "private.txt"
+    source.write_text("test secret")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pigeon.cli",
+            "attachment",
+            "upload",
+            str(uuid4()),
+            str(source),
+            "--chat",
+            "codex:example",
+        ],
+        input="y\n",
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode == 1
+    assert "interactive terminal" in result.stderr
+    assert "test secret" not in result.stdout + result.stderr
+
+
+def test_attachment_cli_confirms_and_uploads(relay, tmp_path):
+    source = tmp_path / "input.txt"
+    source.write_text("approved")
+    cfg = Config(relay=relay.url, agent="@alice/codex", token=relay.alice)
+    profile = tmp_path / "alice.json"
+    save(profile, cfg)
+    chat = "codex:fixture"
+    identity = chat_share(profile, cfg, chat)
+
+    async def invite():
+        async with open_client(relay.url, relay.alice) as owner:
+            shared = await owner.call(identity)
+        async with open_client(relay.url, relay.bob) as peer:
+            joined = await peer.call(Redeem(key=shared["key"], peer_session=True))
+            await peer.call(Capabilities(features=["attachments"]))
+        return joined["conversation_id"]
+
+    session = asyncio.run(invite())
+    master, terminal = pty.openpty()
+    try:
+        with subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "pigeon.cli",
+                "--config",
+                str(profile),
+                "attachment",
+                "upload",
+                session,
+                str(source),
+                "--chat",
+                chat,
+            ],
+            stdin=terminal,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ) as process:
+            os.write(master, b"y\n")
+            try:
+                output, error = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                raise
+            assert process.returncode == 0, error
+    finally:
+        os.close(master)
+        os.close(terminal)
+    assert str(source) in output
+    record = json.loads(output[output.index("{") :])
+    peer = Config(relay=relay.url, agent="@bob/claude", token=relay.bob)
+    destination = tmp_path / "received.txt"
+    download_file(peer, UUID(session), UUID(record["id"]), destination, record["sha256"])
+    assert destination.read_text() == "approved"
+
+
+def test_upload_refuses_symlink_and_fifo(tmp_path, monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("The file must be rejected before transfer")
+
+    monkeypatch.setattr("pigeon.attachments.transfer", unexpected)
+    cfg = Config(relay="ws://127.0.0.1:8765", agent="@alice/codex", token="t" * 43)
+    secret = tmp_path / "private.txt"
+    secret.write_text("test secret")
+    link = tmp_path / "link.txt"
+    link.symlink_to(secret)
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    for path in (link, fifo):
+        with pytest.raises(PigeonError):
+            upload_file(cfg, uuid4(), path)

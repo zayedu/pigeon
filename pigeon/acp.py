@@ -201,8 +201,20 @@ async def run_acp(binary: str, profile: Path, session_id: str | None, *, antigra
                     params["sessionId"] = session_id
                 resume = "session/resume" if antigravity else "session/load"
                 method = resume if session_id else "session/new"
-                result = await client.request(method, params)
-                client.session_id = session_id or result["sessionId"]
+                try:
+                    result = await client.request(method, params)
+                except PigeonError as exc:
+                    if antigravity and str(exc) == "Authentication required":
+                        raise PigeonError(
+                            "auth_required", "Sign in with agy, then retry."
+                        ) from None
+                    raise
+                returned_id = result.get("sessionId") if isinstance(result, dict) else None
+                if session_id and returned_id is not None and returned_id != session_id:
+                    raise PigeonError("acp_session", "ACP returned a different session ID.")
+                client.session_id = session_id or returned_id
+                if not isinstance(client.session_id, str) or not client.session_id.strip():
+                    raise PigeonError("acp_session", "ACP did not return a usable session ID.")
                 session_file.write_text(client.session_id, encoding="utf-8")
                 print(
                     f"{name} session {client.session_id}. Type /exit to leave.\n> ",

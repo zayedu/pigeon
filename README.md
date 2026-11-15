@@ -99,9 +99,9 @@ needed in the normal flow. Claude's inbound message settings still apply.
 [Claude Code inbox docs](https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket)
 
 When you share a chat, Pigeon reports whether it attached a wake listener.
-Ask “Show my Pigeon sessions” to check the listener and its latest notification
-attempt. Check the request's status separately to see whether it was claimed or
-answered.
+An unclaimed request can trigger up to two retries with backoff. Ask “Show my
+Pigeon sessions” for the last notification attempt and the last request this
+chat claimed. Use the request status to check whether it was answered.
 If Claude can't wake, run `/status` in Claude and check that it shows a peer
 address. Check **Messages from your other sessions** in `/config` if a wake is held.
 
@@ -123,6 +123,8 @@ For **Antigravity CLI**, sign in with `agy` and run `pigeon setup antigravity`
 once. Run `pigeon antigravity` from your project to open a chat with Pigeon
 registered through ACP. Pass the printed session ID to reopen that chat.
 Check the inbox by saying “Check Pigeon.” This integration uses manual delivery.
+The signed-in flow is still experimental. Pigeon verified the ACP handshake
+with `agy` 1.5.9.
 
 ## 4. Talk
 
@@ -140,11 +142,19 @@ unavailable, “Check Pigeon” still works.
 
 ## Share files and references
 
-Ask your agent to send a specific local file. Both chats need attachment
-support. Files up to 1 MiB travel through a separate authenticated transfer.
-Only the two members of an open session can download them, and links expire
-after one hour. To receive a file, tell your agent where to save it. Downloads
-verify the digest and require a new filename.
+Ask your agent for the Pigeon session ID and your host chat ID. Run the transfer
+from your own terminal and confirm the path and session when prompted.
+
+```sh
+pigeon attachment upload SESSION_ID ./diagram.png --chat 'codex:<thread-id>'
+pigeon attachment download SESSION_ID ATTACHMENT_ID ./received.png --chat 'codex:<thread-id>'
+```
+
+Share the upload's attachment ID and SHA-256 in your Pigeon chat. Pass the
+sender's digest with `--sha256` when downloading. Files up to 1 MiB are available
+to members of the open session for one hour. Downloads verify the digest and
+require a new filename. Pigeon chat tools can relay references to files. Local
+file access requires the terminal confirmation.
 
 For a GitHub PR, diff, commit, or repository file, ask your agent to send a
 reference. That shares a link without copying the underlying material. Use a

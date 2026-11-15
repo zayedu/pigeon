@@ -15,7 +15,6 @@ from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, Notification, TextContent
 from pydantic import Field
 
-from .attachments import download_file, upload_file
 from .client import ask_agent, open_client
 from .config import Config, chat_share
 from .models import (
@@ -352,6 +351,7 @@ def create_mcp(
         identities: dict[str, object] = {}
         inboxes: dict[str, Config] = {}
         capability_refresh: dict[str, float] = {}
+        wake_attempts: dict[str, dict] = {}
 
         @server.tool()
         async def pigeon_capabilities(ctx: MCPContext, conversation_id: UUID) -> dict:
@@ -371,16 +371,8 @@ def create_mcp(
 
         @server.tool()
         async def pigeon_upload(ctx: MCPContext, conversation_id: UUID, path: str) -> dict:
-            """Upload a file the user authorized. Send the returned reference in this session."""
-            try:
-                actor = await ensure_chat(ctx, create=False)
-                if "attachments" not in relay_features.get(actor.agent, []):
-                    raise PigeonError("unsupported", "This relay does not support attachments.")
-                return await asyncio.to_thread(
-                    upload_file, actor, conversation_id, Path(path).expanduser()
-                )
-            except PigeonError as exc:
-                raise ToolError(str(exc)) from None
+            """Ask the local user to upload a file from their terminal."""
+            raise ToolError("The local user must run pigeon attachment upload in their terminal.")
 
         @server.tool()
         async def pigeon_download(
@@ -390,19 +382,8 @@ def create_mcp(
             destination: str,
             sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")] | None = None,
         ) -> dict:
-            """Save an attachment the user authorized to a new local file."""
-            try:
-                actor = await ensure_chat(ctx, create=False)
-                return await asyncio.to_thread(
-                    download_file,
-                    actor,
-                    conversation_id,
-                    attachment_id,
-                    Path(destination).expanduser(),
-                    sha256,
-                )
-            except PigeonError as exc:
-                raise ToolError(str(exc)) from None
+            """Ask the local user to save an attachment from their terminal."""
+            raise ToolError("The local user must run pigeon attachment download in their terminal.")
 
         async def open_inbox(ctx: MCPContext, *, resume: bool = False):
             async with share_lock:
@@ -474,6 +455,7 @@ def create_mcp(
                             waiting=waiting.setdefault(inbox.agent, set()),
                             features=features,
                             advertised=advertised,
+                            attempts=wake_attempts.setdefault(chat_id, {}),
                         )
                     )
                 if resume:
@@ -509,7 +491,10 @@ def create_mcp(
                     TextContent(type="text", text=result["key"]),
                     TextContent(type="text", text=wake_status),
                 ],
-                structuredContent={"result": result["key"]},
+                structuredContent={
+                    "result": result["key"],
+                    "wake": {"attached": wake, "message": wake_status},
+                },
             )
 
         register_session_tools(
@@ -517,6 +502,7 @@ def create_mcp(
             lambda: None,
             restore=partial(open_inbox, resume=True),
             chat_of=chat_id_for,
+            wake_state=wake_state,
         )
 
     return server
@@ -529,6 +515,7 @@ def register_session_tools(
     claim_session: Callable[[], None] | None = None,
     restore=None,
     chat_of: Callable[[MCPContext], str | None] | None = None,
+    wake_state: dict[str, dict] | None = None,
 ):
     locks: dict[str, asyncio.Lock] = {}
     claimed = False
@@ -570,6 +557,11 @@ def register_session_tools(
                     if pending is None or pending.status != "running":
                         result = await client.call(Take(wait=wait))
                         pending = Turn.model_validate(result) if result else None
+                        if pending is not None and wake_state is not None:
+                            wake_state.setdefault(key, {})["last_claim"] = {
+                                "request_id": str(pending.request.id),
+                                "observed_at": time.time(),
+                            }
                     if pending is not None and allowed and pending.request.sender not in allowed():
                         await client.call(
                             Finish(

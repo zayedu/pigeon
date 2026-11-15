@@ -43,7 +43,10 @@ The state moves from `queued` to `running` when the recipient claims it.
 Terminal states are `completed`, `failed`, `timed_out`, and `cancelled`.
 A wake notification is a client attempt to surface a queued request, or a
 terminal result for a request that client sent. It is not a relay state, and
-it does not mean the request ran.
+it does not mean the request ran. Current listeners make up to three attempts
+per queued request, with backoff. Transient relay reconnects retain that budget.
+Reopening the whole chat starts a fresh listener and can wake it for work
+that is still queued. A claim removes the request from subsequent watch results.
 
 A conversation has two members. Either member can submit a new message ID
 after the previous turn is terminal. Context stays fixed. Only one turn per
@@ -84,11 +87,14 @@ session whose peer advertises attachments. Share the returned opaque ID and
 SHA-256 in a text message. GET
 `/v1/sessions/{conversation_id}/attachments/{id}` returns raw bytes and
 `X-Pigeon-SHA256`. Downloads require membership in that same open session.
-The relay serves bytes as an opaque download and the MCP client verifies the
+The relay serves bytes as an opaque download and the terminal client verifies the
 digest before saving. WebSocket frames carry only text.
 
 Each attachment holds at most 1 MiB and expires after one hour. The relay
-allows eight live attachments per session and 256 in total. A self-hosted
+allows eight files per session, 32 files or 16 MiB per uploader account,
+and 256 files or 64 MiB globally. Limits are checked inside the same write
+transaction as the upload. An attachment from an older relay without uploader
+metadata counts against both participating accounts until it expires. A self-hosted
 relay prunes expired data periodically. Hosted storage prunes it on upload.
 Expiry blocks reads immediately on both paths. Operators can schedule
 `pigeon relay prune-attachments` with the hosted database environment

@@ -23,6 +23,7 @@ import typer
 from pydantic import ValidationError
 
 from .adapters import Claude, Codex
+from .attachments import download_file, upload_file
 from .client import ask_agent, open_client, relay_endpoint
 from .config import (
     Config,
@@ -59,6 +60,8 @@ from .server import serve
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 relay_app = typer.Typer(no_args_is_help=True, help="Run a relay and manage its agent credentials.")
 app.add_typer(relay_app, name="relay")
+attachment_app = typer.Typer(no_args_is_help=True, help="Transfer a file from your terminal.")
+app.add_typer(attachment_app, name="attachment")
 
 Database = Annotated[Path, typer.Option("--db", help="Relay SQLite database.")]
 Wait = Annotated[int, typer.Option(min=0, max=60, help="Seconds to wait for a response.")]
@@ -167,6 +170,45 @@ def inspect_profile(path: Path, chat: str | None) -> Config:
     identity = chat_share(path, config, chat, existing_only=True)
     result = asyncio.run(rpc(config, identity.model_copy(update={"resume": True})))
     return Config(relay=config.relay, agent=result["address"], token=result["token"])
+
+
+def confirm_transfer(action: str, path: Path, conversation_id: UUID) -> Path:
+    if not sys.stdin.isatty():
+        raise PigeonError(
+            "approval_required", "Run this transfer in your own interactive terminal."
+        )
+    path = path.expanduser()
+    try:
+        path = path.parent.resolve(strict=True) / path.name
+    except OSError:
+        raise PigeonError("file_path", "Choose a file in an existing directory.") from None
+    typer.echo(f"{action} {str(path)!r} in session {conversation_id}.")
+    typer.confirm("Authorize this transfer", abort=True)
+    return path
+
+
+@attachment_app.command("upload")
+def attachment_upload(
+    ctx: typer.Context, conversation_id: UUID, source: Path, chat: Annotated[str, typer.Option()]
+):
+    """Upload a file selected and confirmed by the local user."""
+    source = confirm_transfer("Upload", source, conversation_id)
+    show(upload_file(inspect_profile(setup_profile(ctx), chat), conversation_id, source))
+
+
+@attachment_app.command("download")
+def attachment_download(
+    ctx: typer.Context,
+    conversation_id: UUID,
+    attachment_id: UUID,
+    destination: Path,
+    chat: Annotated[str, typer.Option()],
+    sha256: str | None = None,
+):
+    """Save an attachment to a new file selected and confirmed by the local user."""
+    destination = confirm_transfer("Download to", destination, conversation_id)
+    actor = inspect_profile(setup_profile(ctx), chat)
+    show(download_file(actor, conversation_id, attachment_id, destination, sha256))
 
 
 def show(value):

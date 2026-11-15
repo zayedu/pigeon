@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS turns (
     claim_token TEXT
 );
 CREATE INDEX IF NOT EXISTS conversation_turns ON turns(conversation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS conversations_by_recipient ON conversations(recipient);
 CREATE INDEX IF NOT EXISTS active_turns ON turns(status, deadline)
     WHERE status IN ('queued', 'running');
 CREATE TABLE IF NOT EXISTS chat_capabilities (
@@ -97,6 +98,10 @@ CREATE TABLE IF NOT EXISTS attachments (
     data BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS attachment_expiry ON attachments(expires_at);
+CREATE TABLE IF NOT EXISTS attachment_uploaders (
+    attachment_id TEXT PRIMARY KEY REFERENCES attachments(id) ON DELETE CASCADE,
+    account TEXT NOT NULL
+);
 """
 
 MIGRATIONS = (
@@ -108,6 +113,8 @@ MIGRATIONS = (
     "ALTER TABLE conversations ADD COLUMN closed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE turns ADD COLUMN claimed_at REAL",
     "ALTER TABLE turns ADD COLUMN claim_token TEXT",
+    """CREATE INDEX IF NOT EXISTS queued_by_recipient ON turns(recipient)
+       WHERE status='queued'""",
 )
 
 TURN = """
@@ -121,14 +128,6 @@ SELECT t.id, t.conversation_id, t.request, t.submitted_context, t.timeout, t.cre
               WHERE earlier.conversation_id=t.conversation_id AND earlier.rowid<t.rowid)
           AS follow_up
 FROM turns t JOIN conversations c ON c.id = t.conversation_id
-"""
-
-QUEUED = """
- WHERE COALESCE(t.recipient, c.recipient)=? AND t.deadline>? AND t.status='queued'
-"""
-OLDEST = " ORDER BY t.rowid LIMIT 1"
-WATCH_HEADERS = """
-SELECT t.id, t.deadline FROM turns t JOIN conversations c ON c.id=t.conversation_id
 """
 
 
@@ -636,17 +635,38 @@ class Store:
 
     def next_message(self, recipient: str) -> dict | None:
         with self.transaction(write=False) as db:
-            row = db.execute(WATCH_HEADERS + QUEUED + OLDEST, (recipient, time.time())).fetchone()
+            row = self.next_queued(db, recipient, time.time())
         return {"message_id": row["id"], "deadline": row["deadline"]} if row else None
 
-    def watch_activity(self, agent: str, frame: ActivityWatch) -> dict | None:
+    @staticmethod
+    def next_queued(db, recipient: str, now: float, skip=()):
+        excluded = ",".join("?" for _ in skip)
+        criteria = "t.status='queued' AND t.deadline>?"
+        if excluded:
+            criteria += f" AND t.id NOT IN ({excluded})"
+        params = (recipient, now, *(str(item) for item in skip))
+        return db.execute(
+            f"""SELECT t.id, t.deadline, t.rowid AS ordinal FROM turns t
+                WHERE t.recipient=? AND {criteria}
+                UNION ALL
+                SELECT t.id, t.deadline, t.rowid AS ordinal FROM conversations c
+                JOIN turns t ON c.id=t.conversation_id
+                WHERE c.recipient=? AND t.recipient IS NULL AND {criteria}
+                ORDER BY ordinal LIMIT 1""",
+            (*params, *params),
+        ).fetchone()
+
+    def watch_activity(
+        self, agent: str, frame: ActivityWatch, credential_digest: str
+    ) -> dict | None:
         with self.transaction(write=False) as db:
-            skipped = ",".join("?" for _ in frame.skip)
-            exclude = f" AND t.id NOT IN ({skipped})" if frame.skip else ""
-            row = db.execute(
-                WATCH_HEADERS + QUEUED + exclude + OLDEST,
-                (agent, time.time(), *(str(item) for item in frame.skip)),
-            ).fetchone()
+            if not db.execute(
+                "SELECT 1 FROM agents WHERE address=? AND token_hash=?",
+                (agent, credential_digest),
+            ).fetchone():
+                raise PigeonError("unauthenticated", "Credential is no longer valid.")
+            now = time.time()
+            row = self.next_queued(db, agent, now, frame.skip)
             replies = []
             if frame.replies:
                 placeholders = ",".join("?" for _ in frame.replies)
@@ -654,8 +674,9 @@ class Store:
                     f"""SELECT t.id, t.conversation_id FROM turns t
                         JOIN conversations c ON c.id=t.conversation_id
                         WHERE COALESCE(t.sender, c.sender)=?
-                        AND t.status NOT IN (?, ?) AND t.id IN ({placeholders})""",
-                    (agent, *ACTIVE, *(str(item) for item in frame.replies)),
+                        AND (t.status NOT IN (?, ?) OR t.deadline<=?)
+                        AND t.id IN ({placeholders})""",
+                    (agent, *ACTIVE, now, *(str(item) for item in frame.replies)),
                 ).fetchall()
         if row or replies:
             incoming = {"id": row["id"], "deadline": row["deadline"]} if row else None
@@ -704,6 +725,7 @@ class Store:
         digest = hashlib.sha256(data).hexdigest()
         attachment_id = str(uuid4())
         expires = now + 3600
+        account = agent.partition("/")[0]
         with self.transaction() as db:
             peer = self.session_peer(db, agent, conversation_id)
             row = db.execute(
@@ -719,12 +741,26 @@ class Store:
             ).fetchone()["n"]
             if count >= 8:
                 raise PigeonError("limit", "This session already has eight live attachments.")
-            if db.execute("SELECT COUNT(*) AS n FROM attachments").fetchone()["n"] >= 256:
+            usage = db.execute(
+                """SELECT COUNT(*) AS n, COALESCE(SUM(length(a.data)), 0) AS bytes
+                   FROM attachments a JOIN conversations c ON c.id=a.conversation_id
+                   LEFT JOIN attachment_uploaders u ON u.attachment_id=a.id
+                   WHERE u.account=? OR (u.account IS NULL AND (
+                   c.sender LIKE ? ESCAPE '!' OR c.recipient LIKE ? ESCAPE '!'))""",
+                (account, account.replace("_", "!_") + "/%", account.replace("_", "!_") + "/%"),
+            ).fetchone()
+            if usage["n"] >= 32 or usage["bytes"] + len(data) > 16 * MAX_ATTACHMENT:
+                raise PigeonError("limit", "Your account's attachment storage is full.")
+            total = db.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(length(data)), 0) AS bytes FROM attachments"
+            ).fetchone()
+            if total["n"] >= 256 or total["bytes"] + len(data) > 64 * MAX_ATTACHMENT:
                 raise PigeonError("limit", "Relay attachment storage is full. Try again later.")
             db.execute(
                 "INSERT INTO attachments VALUES (?, ?, ?, ?, ?, ?)",
                 (attachment_id, conversation_id, filename, digest, expires, data),
             )
+            db.execute("INSERT INTO attachment_uploaders VALUES (?, ?)", (attachment_id, account))
         return {"id": attachment_id, "filename": filename, "sha256": digest, "expires_at": expires}
 
     def download_attachment(self, agent: str, conversation_id: str, attachment_id: str):
@@ -746,7 +782,7 @@ class Store:
     def take(self, recipient: str) -> dict | None:
         now = time.time()
         with self.transaction() as db:
-            row = db.execute(TURN + QUEUED + OLDEST, (recipient, now)).fetchone()
+            row = self.next_queued(db, recipient, now)
             if not row:
                 return None
             token = secrets.token_hex(8)

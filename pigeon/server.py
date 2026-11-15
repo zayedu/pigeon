@@ -43,14 +43,19 @@ from .models import (
 def create_app(path: Path | None) -> FastAPI:
     store = open_store(path)
     shared = path is None
-    changed = asyncio.Event()
+    changes: dict[str, asyncio.Event] = {}
     connections: Counter[str] = Counter()
     buckets: dict[str, tuple[float, float]] = {}
 
-    def notify():
-        nonlocal changed
-        changed.set()
-        changed = asyncio.Event()
+    def notify(*agents: str):
+        for agent in agents or tuple(changes):
+            event = changes.pop(agent, None)
+            if event is not None:
+                event.set()
+
+    def notify_turn(turn):
+        request = turn["request"]
+        notify(request["sender"], request["recipient"])
 
     async def sweep():
         while True:
@@ -176,9 +181,11 @@ def create_app(path: Path | None) -> FastAPI:
         if isinstance(frame, (Inspect, Take, Watch, ActivityWatch)):
             until = monotonic() + frame.wait
             while True:
-                if await storage(store.authenticate, digest) != agent:
+                if not isinstance(frame, ActivityWatch) and (
+                    await storage(store.authenticate, digest) != agent
+                ):
                     raise PigeonError("unauthenticated", "Credential is no longer valid.")
-                event = changed
+                event = changes.setdefault(agent, asyncio.Event())
                 if isinstance(frame, Inspect):
                     if shared:
                         await storage(store.expire)
@@ -186,9 +193,7 @@ def create_app(path: Path | None) -> FastAPI:
                     if result["status"] != frame.after or result["status"] not in ACTIVE:
                         return result
                 elif isinstance(frame, ActivityWatch):
-                    if shared and frame.replies:
-                        await storage(store.expire)
-                    result = await storage(store.watch_activity, agent, frame)
+                    result = await storage(store.watch_activity, agent, frame, digest)
                     if result:
                         return result
                 else:
@@ -196,7 +201,7 @@ def create_app(path: Path | None) -> FastAPI:
                     result = await storage(operation, agent)
                     if result:
                         if isinstance(frame, Take):
-                            notify()
+                            notify_turn(result)
                         return result
                 remaining = until - monotonic()
                 if remaining <= 0:
@@ -232,7 +237,10 @@ def create_app(path: Path | None) -> FastAPI:
                 return await storage(store.redeem, agent, frame.key, frame.peer_session)
             case Ping():
                 return {"agent": agent, "protocol": 1, "features": RELAY_FEATURES}
-        notify()
+        if isinstance(frame, (Submit, Cancel, Finish)):
+            notify_turn(result)
+        else:
+            notify()
         return result
 
     @app.websocket("/v1/ws")
@@ -262,10 +270,12 @@ def create_app(path: Path | None) -> FastAPI:
                     await socket.close(code=1009)
                     break
                 try:
-                    if await storage(store.authenticate, digest) != agent:
+                    frame = command.validate_json(raw)
+                    if not isinstance(frame, (Inspect, Take, Watch, ActivityWatch)) and (
+                        await storage(store.authenticate, digest) != agent
+                    ):
                         raise PigeonError("unauthenticated", "Credential is no longer valid.")
                     rate_limit(agent)
-                    frame = command.validate_json(raw)
                     operation = asyncio.create_task(dispatch(agent, digest, frame))
                     await asyncio.wait((operation, receive), return_when=asyncio.FIRST_COMPLETED)
                     if receive.done() and receive.result()["type"] == "websocket.disconnect":
@@ -291,6 +301,7 @@ def create_app(path: Path | None) -> FastAPI:
             connections[agent] -= 1
             if not connections[agent]:
                 del connections[agent]
+                changes.pop(agent, None)
 
     return app
 

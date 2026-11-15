@@ -90,3 +90,49 @@ latency require separate live measurements.
   with a signed-in Codex client to repeat it against a disposable local
   relay and chat. Before deployment, run the live Claude and Antigravity
   checks and smoke test attachments against a nonproduction hosted database.
+
+## Reliability and security audit
+
+- **Wake.** `wake.listen` used a successful host call to suppress all further
+  attempts. It now makes up to three attempts for work that remains queued.
+  A relay reconnect or listener replacement in the same MCP process preserves
+  the attempt history. Restarting the process allows a fresh set of attempts.
+  `pigeon_share` retains the key in `result` and adds structured wake status.
+  `pigeon_status` reports the most recent local claim separately.
+- **File access.** MCP transfer handlers previously opened caller-provided
+  paths. Host permission settings vary, so Pigeon now uses the terminal
+  transfer commands for local file access. The user confirms the exact path
+  and session. Existing attachment IDs and the HTTP protocol remain valid.
+- **Storage.** Per-session counts did not stop one account filling the relay
+  across many chats. The upload transaction now checks account and relay
+  byte limits. A separate uploader table preserves the prior attachment row
+  format and lets old rows count against both accounts until expiry. The
+  relay's cap applies to live payload bytes. Database pages, WAL files,
+  backups, and provider storage usage follow their own retention rules.
+- **Antigravity.** A checksum-verified `agy` 1.5.9 binary initialized ACP
+  protocol 1. Creating a chat stopped at Google authentication. The signed-in
+  registration, resume, and manual receive paths remain a live release check.
+  The ACP stub covers registration and the local relay tests cover identity
+  isolation and resume. Pigeon exposes manual inbox checks for this launcher.
+- **Relay.** The previous watch opened separate authentication and lookup
+  connections and ordinary turn updates woke all listeners. Activity watch
+  now uses one database connection per poll, and turn updates signal only their
+  participants. SQLite's query plan now uses `queued_by_recipient` rather
+  than scanning the turns table. The legacy branch covers older rows without
+  per-turn recipients. Cross-instance notices still rely on the one-second
+  shared-store poll. Each shared-store transaction still opens a connection,
+  and the 16-socket limit is per credential per relay process.
+
+Run `uv run --locked python tests/bench_relay.py 100 1000 --seconds 6` to
+repeat the local WebSocket load test. It exercises the hosted polling code
+with SQLite and measures 12 sequential submit-to-claim samples under load.
+
+| Idle clients | Idle store connections/listener/s, before → after | Submit-to-claim p50 / p95, before → after |
+| --- | --- | --- |
+| 100 | 2.33 → 1.00 | 284 / 437 ms → 6.4 / 24.7 ms |
+| 1,000 | 1.29 → 1.00 | 3,291 / 3,603 ms → 6.5 / 7.5 ms |
+
+An intermediate 10,000-client run opened all idle sockets, but a new
+sender's WebSocket handshake timed out under load. It produced no valid
+message latency sample. These tests establish neither a hosted Turso
+capacity limit nor a production latency estimate.
