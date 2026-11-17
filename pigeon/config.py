@@ -102,6 +102,17 @@ def chat_share(
         return share
 
 
+def write_atomic(path: Path, text: str):
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            handle.write(text)
+            handle.flush()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 @contextmanager
 def config_lock(path: Path):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)

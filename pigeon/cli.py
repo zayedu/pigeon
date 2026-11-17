@@ -37,23 +37,33 @@ from .config import (
     save,
     state_path,
     validate_token,
+    write_atomic,
 )
 from .daemon import Daemon, Echo, Sessions
 from .db import open_store
 from .models import (
     ACTIVE,
+    MAX_WAIT,
     Cancel,
     Capabilities,
     Close,
     Command,
     Context,
+    Finish,
     Grant,
+    History,
     Inspect,
     ListCalls,
     PigeonError,
     Ping,
+    Redeem,
+    Renew,
     Signup,
+    Status,
+    Take,
+    Turn,
     address,
+    message_problem,
 )
 from .server import serve
 
@@ -64,7 +74,15 @@ attachment_app = typer.Typer(no_args_is_help=True, help="Transfer a file from yo
 app.add_typer(attachment_app, name="attachment")
 
 Database = Annotated[Path, typer.Option("--db", help="Relay SQLite database.")]
-Wait = Annotated[int, typer.Option(min=0, max=60, help="Seconds to wait for a response.")]
+Wait = Annotated[int, typer.Option(min=0, max=600, help="Seconds to wait for a response.")]
+Chat = Annotated[
+    str | None,
+    typer.Option(help="Act as this chat's inbox, e.g. codex:<thread-id> or cursor:<chat-id>."),
+]
+RequiredChat = Annotated[
+    str, typer.Option(help="Act as this chat's inbox, e.g. codex:<thread-id> or cursor:<chat-id>.")
+]
+Message = Annotated[str, typer.Argument(help="Message text, or - to read it from stdin.")]
 HOSTED_RELAY = "wss://pigeon-relay-rust.vercel.app"
 HOMEBREW_LAUNCHER_ENV = "PIGEON_HOMEBREW_LAUNCHER"
 # Hashes of stock skills shipped before installations recorded their own digest.
@@ -165,15 +183,29 @@ async def rpc(config: Config, command: Command):
         return await client.call(command)
 
 
-def inspect_profile(path: Path, chat: str | None) -> Config:
+def inspect_profile(path: Path, chat: str | None, *, create: bool = False) -> Config:
+    """Return the account, or the inbox of one chat. Never substitutes one for the other."""
     config = load(path)
     if chat is None:
         return config
     if chat.partition(":")[0] not in {"codex", "claude", "cursor", "antigravity"}:
         raise PigeonError("chat_id", "Use a chat ID such as codex:<thread-id>.")
-    identity = chat_share(path, config, chat, existing_only=True)
-    result = asyncio.run(rpc(config, identity.model_copy(update={"resume": True})))
+    identity = chat_share(path, config, chat, existing_only=not create)
+    try:
+        result = asyncio.run(rpc(config, identity.model_copy(update={"resume": True})))
+    except PigeonError as exc:
+        if not create or exc.code != "not_found":
+            raise
+        result = asyncio.run(rpc(config, identity))
     return Config(relay=config.relay, agent=result["address"], token=result["token"])
+
+
+def read_message(message: str) -> str:
+    if message == "-":
+        message = sys.stdin.read().removesuffix("\n")
+    if problem := message_problem(message):
+        raise PigeonError("message_limit", problem)
+    return message
 
 
 def confirm_transfer(action: str, path: Path, conversation_id: UUID) -> Path:
@@ -314,7 +346,17 @@ def setup(
     install_skill(client)
 
 
+def pigeon_command() -> list[str]:
+    launcher = os.environ.get(HOMEBREW_LAUNCHER_ENV)
+    return [launcher] if launcher else [sys.executable, "-m", "pigeon.cli"]
+
+
+def cursor_hooks_path() -> Path:
+    return Path.home() / ".cursor" / "hooks.json"
+
+
 def skill_path(client: str) -> Path:
+    # Codex and Cursor both read ~/.agents/skills.
     skill_root = Path.home() / ".agents"
     if client == "claude":
         skill_root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
@@ -349,11 +391,40 @@ def install_skill(client: str, *, existing_only: bool = False):
         stamp.write_text(digest + "\n", encoding="utf-8")
 
 
+SKILL_HOSTS = ("codex", "claude", "cursor", "antigravity")
+
+
 @app.command(hidden=True)
 def refresh_skills():
     """Refresh previously installed skills from this version."""
-    for client in ("codex", "claude", "antigravity"):
+    for client in {skill_path(client): client for client in SKILL_HOSTS}.values():
         install_skill(client, existing_only=True)
+    from . import cursor
+
+    try:
+        servers = json.loads((Path.home() / ".cursor" / "mcp.json").read_text())["mcpServers"]
+        # Pigeon registers [..., "--config", PROFILE, "mcp"] with an optional "--cursor".
+        registered = any(
+            "--config" in item.get("args", []) and "mcp" in item.get("args", [])
+            for item in servers.values()
+        )
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        registered = False
+    if registered and not cursor.hook_installed(cursor_hooks_path()):
+        typer.echo("Run pigeon setup cursor again so Cursor chats can use Pigeon.")
+
+
+@app.command("cursor-hook", hidden=True)
+def cursor_hook():
+    """Answer a Cursor preToolUse hook event on stdin."""
+    from . import cursor
+
+    try:
+        result = cursor.hook(json.load(sys.stdin))
+    except (PigeonError, ValueError) as exc:
+        reason = f"Pigeon's Cursor hook failed: {exc}"
+        result = {"permission": "deny", "agent_message": reason, "user_message": reason}
+    typer.echo(json.dumps(result))
 
 
 @app.command()
@@ -701,14 +772,15 @@ def send(ctx: typer.Context, to: str, message: str, wait: Wait = 15, pr: str | N
 
 
 @app.command()
-def reply(ctx: typer.Context, conversation_id: UUID, message: str, wait: Wait = 15):
-    """Send a follow-up after a completed turn."""
-    config = load(ctx.obj)
+def reply(
+    ctx: typer.Context, conversation_id: UUID, message: Message, wait: Wait = 15, chat: Chat = None
+):
+    """Send the next message in a session after the previous turn ends."""
+    actor = inspect_profile(setup_profile(ctx), chat)
+    text = read_message(message)
     show(
         asyncio.run(
-            ask_agent(
-                config.relay, config.token, message, conversation_id=conversation_id, wait=wait
-            )
+            ask_agent(actor.relay, actor.token, text, conversation_id=conversation_id, wait=wait)
         )
     )
 
@@ -718,38 +790,109 @@ def status(
     ctx: typer.Context,
     conversation_id: UUID | None = None,
     message_id: UUID | None = None,
-    chat: Annotated[str | None, typer.Option(help="Local chat ID, e.g. codex:<thread-id>.")] = None,
+    chat: Chat = None,
     pending: Annotated[bool, typer.Option(help="List only pending requests.")] = False,
+    wait: Annotated[
+        int, typer.Option(min=0, max=600, help="Seconds to wait for the request to change.")
+    ] = 0,
+    after: Annotated[
+        Status | None, typer.Option(help="Wait while the request is in this state.")
+    ] = None,
 ):
-    """List recent conversations or inspect one conversation."""
+    """List recent conversations, or inspect and optionally wait on one request."""
     if message_id and not conversation_id:
         raise PigeonError("missing_conversation", "Specify a conversation ID with --message-id.")
-    query = (
-        Inspect(conversation_id=conversation_id, message_id=message_id)
-        if conversation_id
-        else (ListCalls())
-    )
     if pending and conversation_id:
         raise PigeonError("invalid_option", "Use --pending without a conversation ID.")
-    result = asyncio.run(rpc(inspect_profile(setup_profile(ctx), chat), query))
-    show([row for row in result if row["status"] in ACTIVE] if pending else result)
+    actor = inspect_profile(setup_profile(ctx), chat)
+    if conversation_id is None:
+        result = asyncio.run(rpc(actor, ListCalls()))
+        show([row for row in result if row["status"] in ACTIVE] if pending else result)
+        return
+
+    async def inspect():
+        async with open_client(actor.relay, actor.token) as client:
+            turn = await client.turn(
+                Inspect(conversation_id=conversation_id, message_id=message_id)
+            )
+            if wait and (after is None or turn.status == after):
+                turn = await client.wait_for(turn, wait, until_terminal=False)
+            return turn
+
+    show(asyncio.run(inspect()))
 
 
 @app.command()
-def cancel(ctx: typer.Context, conversation_id: UUID, message_id: UUID):
-    """Cancel a request you sent."""
+def history(
+    ctx: typer.Context,
+    conversation_id: UUID,
+    chat: Chat = None,
+    limit: Annotated[int, typer.Option(min=1, max=50)] = 20,
+    before: Annotated[
+        int | None, typer.Option(min=1, help="Cursor from the previous page.")
+    ] = None,
+):
+    """Show earlier turns in a session, newest first."""
+    actor = inspect_profile(setup_profile(ctx), chat)
     show(
         asyncio.run(
-            rpc(load(ctx.obj), Cancel(conversation_id=conversation_id, message_id=message_id))
+            rpc(actor, History(conversation_id=conversation_id, limit=limit, before=before))
         )
     )
 
 
 @app.command()
-def close(ctx: typer.Context, conversation_id: UUID):
+def connect(ctx: typer.Context, key: str, chat: RequiredChat):
+    """Join a Pigeon session key as one chat."""
+    join = Redeem(key=key.strip(), peer_session=True)
+    actor = inspect_profile(setup_profile(ctx), chat, create=True)
+    show(asyncio.run(rpc(actor, join)))
+
+
+@app.command()
+def receive(ctx: typer.Context, chat: RequiredChat, wait: Wait = 0):
+    """Claim the next queued request for a chat. Prints null when none arrives."""
+    actor = inspect_profile(setup_profile(ctx), chat)
+
+    async def take():
+        until = time.monotonic() + wait
+        async with open_client(actor.relay, actor.token) as client:
+            while True:
+                remaining = round(until - time.monotonic())
+                result = await client.call(Take(wait=max(0, min(MAX_WAIT, remaining))))
+                if result or remaining <= MAX_WAIT:
+                    return result
+
+    result = asyncio.run(take())
+    show(Turn.model_validate(result) if result else None)
+
+
+@app.command()
+def answer(ctx: typer.Context, message_id: UUID, message: Message, chat: RequiredChat):
+    """Answer a request this chat claimed."""
+    actor = inspect_profile(setup_profile(ctx), chat)
+    text = read_message(message)
+    show(asyncio.run(rpc(actor, Finish(message_id=message_id, status="completed", content=text))))
+
+
+@app.command()
+def extend(ctx: typer.Context, message_id: UUID, chat: RequiredChat):
+    """Extend the deadline of a request this chat claimed and is still working on."""
+    show(asyncio.run(rpc(inspect_profile(setup_profile(ctx), chat), Renew(message_id=message_id))))
+
+
+@app.command()
+def cancel(ctx: typer.Context, conversation_id: UUID, message_id: UUID, chat: Chat = None):
+    """Cancel a request you sent."""
+    actor = inspect_profile(setup_profile(ctx), chat)
+    show(asyncio.run(rpc(actor, Cancel(conversation_id=conversation_id, message_id=message_id))))
+
+
+@app.command()
+def close(ctx: typer.Context, conversation_id: UUID, chat: Chat = None):
     """Close one invitation session. Its history stays readable."""
-    show(asyncio.run(rpc(load(ctx.obj), Close(conversation_id=conversation_id))))
-    typer.echo(f"Closed session {conversation_id}. Other sessions stay open.")
+    actor = inspect_profile(setup_profile(ctx), chat)
+    show(asyncio.run(rpc(actor, Close(conversation_id=conversation_id))))
 
 
 @app.command()
@@ -777,14 +920,23 @@ def doctor(ctx: typer.Context, chat: str | None = None):
         for command, label in (
             ("codex", "Codex"),
             ("claude", "Claude Code"),
-            ("cursor-agent", "Cursor"),
+            ("cursor-agent", "Cursor CLI"),
+            ("cursor", "Cursor"),
             ("agy", "Antigravity"),
         )
         if shutil.which(command)
     ]
     typer.echo(f"Agent executables on PATH: {', '.join(integrations) or 'none'}.")
-    installed = [host for host in ("codex", "claude", "antigravity") if skill_path(host).is_file()]
+    installed = [host for host in SKILL_HOSTS if skill_path(host).is_file()]
     typer.echo(f"Pigeon skills installed for: {', '.join(installed) or 'none'}.")
+    if (Path.home() / ".cursor").is_dir():
+        from . import cursor
+
+        ready = cursor.hook_installed(cursor_hooks_path()) and cursor.load_key(create=False)
+        typer.echo(
+            "Cursor chat identity hook: "
+            + ("installed." if ready else "missing. Run pigeon setup cursor and reload Cursor.")
+        )
     daemon_status(ctx)
     exposure = config.exposure
     if exposure and exposure.workspace:
@@ -810,6 +962,7 @@ def mcp_server(
     codex_endpoint: str | None = None,
     claude_channel: bool = False,
     cursor_endpoint: str | None = None,
+    cursor: Annotated[bool, typer.Option(help="Identify chats with Pigeon's Cursor hook.")] = False,
     antigravity_session_file: Path | None = None,
 ):
     """Run the local stdio MCP server."""
@@ -823,6 +976,7 @@ def mcp_server(
         any(wake_options),
         claude_channel,
         cursor_endpoint is not None,
+        cursor,
         antigravity_session_file is not None,
     )
     if (any(wake_options) and not all(wake_options)) or sum(targets) + session > 1:
@@ -842,6 +996,7 @@ def mcp_server(
             else None,
             claude_channel=claude_channel,
             cursor_endpoint=cursor_endpoint,
+            cursor_chat=cursor,
             antigravity_session_file=antigravity_session_file,
             profile=ctx.obj,
         ).run(transport="stdio")
@@ -860,11 +1015,14 @@ def install(
 def register_mcp(path: Path, host: str, scope: str, *, name: str):
     load(path)
     launcher = os.environ.get(HOMEBREW_LAUNCHER_ENV)
-    command = [launcher] if launcher else [sys.executable, "-m", "pigeon.cli"]
-    command.extend(["--config", str(path), "mcp"])
+    command = [*pigeon_command(), "--config", str(path), "mcp"]
     if host == "cursor":
-        register_cursor(Path.home() / ".cursor" / "mcp.json", name, command)
-        typer.echo("Reload Cursor to load Pigeon.")
+        from . import cursor
+
+        register_cursor(Path.home() / ".cursor" / "mcp.json", name, [*command, "--cursor"])
+        cursor.load_key(create=True)
+        cursor.register_hook(cursor_hooks_path(), shlex.join([*pigeon_command(), "cursor-hook"]))
+        typer.echo("Reload Cursor to load Pigeon and its chat identity hook.")
         return
     binary = shutil.which(host)
     if not binary:
@@ -901,16 +1059,11 @@ def register_cursor(path: Path, name: str, command: list[str]):
         if name in servers:
             if servers[name] == entry:
                 return
-            raise PigeonError("already_installed", f"{name} is already registered in {path}.")
+            # Upgrade the entry an earlier Pigeon wrote before hook identity existed.
+            if servers[name] != {**entry, "args": entry["args"][:-1]}:
+                raise PigeonError("already_installed", f"{name} is already registered in {path}.")
         servers[name] = entry
-        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as handle:
-            temporary = Path(handle.name)
-            try:
-                handle.write(json.dumps(settings, indent=2) + "\n")
-                handle.flush()
-                temporary.replace(path)
-            finally:
-                temporary.unlink(missing_ok=True)
+        write_atomic(path, json.dumps(settings, indent=2) + "\n")
 
 
 def main():

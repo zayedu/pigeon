@@ -36,7 +36,7 @@ Run the setup command for your agent and choose a username when prompted.
 | --- | --- |
 | Codex | `pigeon setup codex` |
 | Claude Code | `pigeon setup claude` |
-| Cursor CLI | `pigeon setup cursor` |
+| Cursor (editor and CLI) | `pigeon setup cursor` |
 | Antigravity CLI | `pigeon setup antigravity` |
 
 Reopen your agent in the project. If the agent reports missing Pigeon tools
@@ -65,9 +65,14 @@ From either chat, tell your agent:
 > Ask the other chat why it changed the cache invalidation logic.
 
 When wake is available, Pigeon can prompt an idle chat. Otherwise, the Pigeon
-skill tells the agent to check periodically during its current turn when it
-expects a message. You can also say “Check Pigeon” at any time. Either chat
+skill tells the agent to keep checking during its current turn when it expects
+a message. Each check waits on the relay until something changes, so slow
+answers still arrive. You can also say “Check Pigeon” at any time. Either chat
 can send a follow-up after the current question is answered.
+
+Messages hold up to 16,000 characters. A question waits up to 5 minutes to be
+picked up. The answering agent then has 10 minutes and can extend that to an
+hour for longer work.
 
 ## File sharing
 
@@ -92,12 +97,17 @@ download verifies the file digest and saves to a new filename.
   See [Client setup and wake](#client-setup-and-wake) if it still needs help.
 - **A reply is pending.** Say “Show my Pigeon sessions” or “Check Pigeon.” When
   you reopen the same chat, check Pigeon to reconnect to its inbox. To finish
-  a claimed request, use its original message ID. If you lost it, ask the
-  sender to cancel and resend.
+  a claimed request, use its original message ID. Ask for the Pigeon history
+  if you lost it.
+- **Both chats sent at once.** A session carries one question at a time. The
+  agent that gets the error answers the other chat’s question first, then
+  sends its own.
 - **You want another connection.** Say “Start a new Pigeon session” for a fresh
   key or “Close this Pigeon session” to end the current one.
 - **You need to update.** With Homebrew, run `brew upgrade pigeon` and rerun
   setup to refresh the skill. With uv, run `pigeon update`. Reopen the agent.
+  Cursor users who set up an earlier version should rerun `pigeon setup cursor`
+  once to add the chat identity hook.
 - **You switched from uv to Homebrew.** If setup reports that `pigeon-relay`
   is already registered, remove that MCP entry in your client and rerun setup
   using `"$(brew --prefix pigeon)/bin/pigeon"`. Your Pigeon profile and chats
@@ -122,9 +132,14 @@ agent to check Pigeon.
   sessions** in `/config`. The `pigeon wake claude` command uses the
   development Channels preview as a diagnostic fallback.
   [Claude Code inbox docs](https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket)
-- **Cursor CLI.** If Pigeon can’t identify your chat, or you want automatic
-  wake, use `pigeon wake cursor`. To resume a chat, close the old instance
-  and add its saved session ID to the command.
+- **Cursor.** Setup registers Pigeon in `~/.cursor/mcp.json` and adds a
+  `preToolUse` hook to `~/.cursor/hooks.json`. The hook tells Pigeon which
+  Cursor chat made each call, so every chat gets its own inbox in the editor
+  and the CLI, including after a restart. Reload Cursor after setup. Cursor
+  still asks you to approve tool calls as usual. The editor can’t be woken by
+  Pigeon, so the agent checks its inbox while it expects a message. For
+  automatic wake in the terminal, open a Cursor CLI chat with
+  `pigeon wake cursor`, adding its saved session ID to resume it.
 - **Antigravity CLI.** Setup installs the skill. If your chat lacks Pigeon’s
   MCP tools or a chat ID, open it with `pigeon antigravity` to supply both.
   Antigravity’s tool approval settings apply. Add the printed session ID to
@@ -133,15 +148,25 @@ agent to check Pigeon.
 </details>
 
 <details>
-<summary>Inspect a chat from the terminal</summary>
+<summary>Act for a chat from the terminal</summary>
+
+Every command takes `--chat` with your host’s chat ID and prefix, such as
+`codex:`, `claude:`, `cursor:`, or `antigravity:`, and prints JSON. Without
+`--chat`, commands act as your account, which is not a member of chat sessions.
 
 ```sh
 pigeon status --chat 'codex:<thread-id>' --pending
 pigeon doctor --chat 'codex:<thread-id>'
+pigeon connect KEY --chat 'cursor:<chat-id>'
+pigeon receive --chat 'cursor:<chat-id>' --wait 60
+pigeon answer REQUEST_ID - --chat 'cursor:<chat-id>' < answer.md
+pigeon reply SESSION_ID - --chat 'cursor:<chat-id>' < question.md
+pigeon status --conversation-id SESSION_ID --message-id REQUEST_ID --chat 'cursor:<chat-id>' --wait 300
+pigeon extend REQUEST_ID --chat 'cursor:<chat-id>'
+pigeon history SESSION_ID --chat 'cursor:<chat-id>'
+pigeon cancel SESSION_ID REQUEST_ID --chat 'cursor:<chat-id>'
+pigeon close SESSION_ID --chat 'cursor:<chat-id>'
 ```
-
-Use your host’s chat ID and the matching prefix, such as `claude:`, `cursor:`,
-or `antigravity:`.
 
 </details>
 

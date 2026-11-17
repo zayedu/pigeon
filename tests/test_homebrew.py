@@ -10,9 +10,16 @@ from pigeon.config import Config, save
 def test_homebrew_setup_registers_stable_launcher(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     launcher = tmp_path / "opt" / "pigeon" / "bin" / "pigeon"
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setenv(HOMEBREW_LAUNCHER_ENV, str(launcher))
     profile = tmp_path / "profile.json"
     save(profile, Config(relay="ws://127.0.0.1:8765", agent="@test/agent", token="a" * 43))
+    # An entry written by an earlier version upgrades in place.
+    (tmp_path / ".cursor").mkdir()
+    old = {"command": str(launcher), "args": ["--config", str(profile), "mcp"]}
+    (tmp_path / ".cursor" / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"pigeon-relay": old}})
+    )
 
     for _ in range(2):
         result = CliRunner().invoke(app, ["--config", str(profile), "setup", "cursor"])
@@ -21,8 +28,17 @@ def test_homebrew_setup_registers_stable_launcher(tmp_path, monkeypatch):
     servers = json.loads((Path.home() / ".cursor" / "mcp.json").read_text())["mcpServers"]
     assert servers["pigeon-relay"] == {
         "command": str(launcher),
-        "args": ["--config", str(profile), "mcp"],
+        "args": ["--config", str(profile), "mcp", "--cursor"],
     }
+    hooks = json.loads((Path.home() / ".cursor" / "hooks.json").read_text())
+    assert hooks["hooks"]["preToolUse"] == [
+        {
+            "command": f"{launcher} cursor-hook",
+            "matcher": "^MCP:pigeon_",
+            "failClosed": True,
+            "timeout": 15,
+        }
+    ]
 
 
 def test_homebrew_update_uses_brew_instructions(monkeypatch):

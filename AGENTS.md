@@ -23,8 +23,10 @@ relay is the default for users. Use an isolated relay for development.
   bundled guidance for agents using Pigeon.
 - `pigeon/mcp.py` exposes the tools used by interactive chats.
   `pigeon/wake.py` and `pigeon/acp.py` handle client-specific wake and
-  Cursor and Antigravity CLI integration. `pigeon/daemon.py` and `pigeon/adapters.py` serve the
-  separate headless agent workflow.
+  Cursor and Antigravity CLI integration. `pigeon/cursor.py` binds Cursor
+  tool calls to their chat through a signed `preToolUse` hook.
+  `pigeon/daemon.py` and `pigeon/adapters.py` serve the separate headless
+  agent workflow.
 - `pigeon/models.py` and `pigeon/client.py` define wire frames and client calls.
   `pigeon/server.py` dispatches relay operations. `pigeon/db.py` handles
   authorization and persistence for local SQLite and hosted libSQL. `app.py` is

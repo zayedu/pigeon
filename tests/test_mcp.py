@@ -163,6 +163,8 @@ def test_cli_daemon_and_stdio_mcp(relay, tmp_path):
                 "pigeon_capabilities",
                 "pigeon_upload",
                 "pigeon_download",
+                "pigeon_history",
+                "pigeon_extend",
             }
 
             refused = await mcp.call_tool("pigeon_ask", {"to": ALICE, "message": "Why cache?"})
@@ -822,6 +824,9 @@ def test_cursor_setup_preserves_existing_servers(relay, tmp_path):
     cursor.parent.mkdir()
     other = {"url": "https://example.test/mcp"}
     cursor.write_text(json.dumps({"mcpServers": {"other": other}}))
+    audit = {"command": "./audit.sh", "matcher": "Shell"}
+    hooks = cursor.with_name("hooks.json")
+    hooks.write_text(json.dumps({"version": 1, "hooks": {"preToolUse": [audit]}}))
     config_home = tmp_path / "config"
     profile = config_home / "pigeon" / "config.json"
     env = os.environ | {"HOME": str(tmp_path), "XDG_CONFIG_HOME": str(config_home)}
@@ -839,7 +844,12 @@ def test_cursor_setup_preserves_existing_servers(relay, tmp_path):
     assert "pigeon_connect" in skill.read_text()
     servers = json.loads(cursor.read_text())["mcpServers"]
     assert servers["other"] == other
-    assert servers["pigeon-relay"]["args"][-3:] == ["--config", str(profile), "mcp"]
+    assert servers["pigeon-relay"]["args"][-4:] == ["--config", str(profile), "mcp", "--cursor"]
+    entries = json.loads(hooks.read_text())["hooks"]["preToolUse"]
+    assert entries[0] == audit
+    assert entries[1]["command"].endswith(" cursor-hook") and entries[1]["failClosed"]
+    assert len(entries) == 2
+    assert S_IMODE((config_home / "pigeon" / "cursor-hook.key").stat().st_mode) == 0o600
 
 
 def test_setup_reuses_legacy_hosted_profile(tmp_path):
@@ -865,7 +875,12 @@ def test_setup_reuses_legacy_hosted_profile(tmp_path):
     assert "Using your Pigeon account @owner." in result.stdout
     assert not profile.with_name("config.json").exists()
     settings = json.loads((tmp_path / ".cursor" / "mcp.json").read_text())
-    assert settings["mcpServers"]["pigeon-relay"]["args"][-3:] == ["--config", str(profile), "mcp"]
+    assert settings["mcpServers"]["pigeon-relay"]["args"][-4:] == [
+        "--config",
+        str(profile),
+        "mcp",
+        "--cursor",
+    ]
 
 
 def test_two_chats_alternate_follow_ups_and_keep_separate_sessions(relay, tmp_path):
