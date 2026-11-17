@@ -10,7 +10,17 @@ from typing import Protocol
 from uuid import uuid4
 
 from .client import open_client
-from .models import LEASE, LEGACY_TEXT, Finish, Inspect, PigeonError, Ping, Renew, Take, Turn
+from .models import (
+    LEASE,
+    LEGACY_TEXT,
+    MAX_WAIT,
+    Finish,
+    Inspect,
+    PigeonError,
+    Ping,
+    Renew,
+    Turn,
+)
 
 log = logging.getLogger(__name__)
 RETRYABLE = {"connection", "storage_unavailable", "rate_limited"}
@@ -154,15 +164,16 @@ class Daemon:
 
     async def worker(self):
         while True:
+            # Reused across retries, so a claim whose reply was lost is returned, not skipped.
+            claim_id = uuid4()
 
             async def take():
                 async with open_client(self.relay, self.token) as client:
-                    return await client.call(Take())
+                    return await client.take(MAX_WAIT, claim_id)
 
-            work = await self.retry(take)
-            if work is None:
+            turn = await self.retry(take)
+            if turn is None:
                 continue
-            turn = Turn.model_validate(work)
             reply = await self.execute(turn)
             if reply is None:
                 continue

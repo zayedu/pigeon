@@ -1,8 +1,9 @@
 import asyncio
 import ipaddress
 import json
+import random
 from contextlib import asynccontextmanager
-from math import ceil
+from math import ceil, floor
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -19,9 +20,26 @@ from .models import (
     Inspect,
     PigeonError,
     Ping,
+    Share,
     Submit,
+    Take,
     Turn,
 )
+
+# Seconds to back off before each retry of a transient relay storage error.
+STORAGE_RETRIES = (0.2, 0.5, 1.2)
+
+
+def retry_safe(request: Command) -> bool:
+    """Whether repeating the frame cannot repeat its effect."""
+    if isinstance(request, Take):
+        # A storage error can follow a committed claim. Only a claim ID makes a retry
+        # return that claim instead of taking the next request.
+        return request.claim_id is not None
+    if isinstance(request, Share):
+        return request.resume
+    # Reads, and writes keyed by message, conversation, or sender, are idempotent.
+    return True
 
 
 def is_loopback(host: str) -> bool:
@@ -80,11 +98,32 @@ class Client:
         self.socket = socket
         self.lock = asyncio.Lock()
 
-    async def call(self, request: Command):
+    async def call(self, request: Command, *, until: float | None = None):
+        """Send one frame. Retry transient storage errors, finishing by `until` if given."""
+        loop = asyncio.get_running_loop()
+        for delay in (*STORAGE_RETRIES, None):
+            try:
+                return await self.send(request)
+            except PigeonError as exc:
+                if exc.code != "storage_unavailable" or delay is None or not retry_safe(request):
+                    raise
+                delay *= random.uniform(0.8, 1.2)
+                if until is not None:
+                    left = until - loop.time() - delay
+                    if left < 0:
+                        raise
+                    if hasattr(request, "wait"):
+                        wait = min(request.wait, floor(left))
+                        request = request.model_copy(update={"wait": wait})
+                await asyncio.sleep(delay)
+        raise AssertionError("Retry loop exhausted.")
+
+    async def send(self, request: Command):
         async with self.lock:
             try:
                 async with asyncio.timeout(MAX_WAIT + 5):
-                    await self.socket.send(request.model_dump_json())
+                    # Omit unset fields so relays that predate them accept the frame.
+                    await self.socket.send(request.model_dump_json(exclude_none=True))
                     response = json.loads(await self.socket.recv())
             except (TimeoutError, asyncio.CancelledError):
                 # A late reply could otherwise be mistaken for the next operation's reply.
@@ -101,8 +140,8 @@ class Client:
             raise PigeonError(response["error"], response["message"], response.get("data"))
         return response["ok"]
 
-    async def turn(self, request: Submit | Inspect) -> Turn:
-        return Turn.model_validate(await self.call(request))
+    async def turn(self, request: Submit | Inspect, *, until: float | None = None) -> Turn:
+        return Turn.model_validate(await self.call(request, until=until))
 
     async def ask(
         self,
@@ -123,25 +162,86 @@ class Client:
                 message_id=message_id or uuid4(),
             )
         )
-        return await self.wait_for(turn, wait)
+        if not wait or turn.status not in ACTIVE:
+            return turn
+        return await self.wait_for(
+            turn.request.conversation_id, turn.request.id, wait, current=turn.status
+        )
 
-    async def wait_for(self, turn: Turn, wait: int, *, until_terminal: bool = True) -> Turn:
-        """Long-poll one turn. Stop at a terminal state or, if not until_terminal, any change."""
-        start = turn.status
-        until = asyncio.get_running_loop().time() + wait
-        while turn.status in ACTIVE and (until_terminal or turn.status == start):
-            remaining = ceil(until - asyncio.get_running_loop().time())
-            if remaining <= 0:
-                break
+    async def wait_for(
+        self,
+        conversation_id: UUID,
+        message_id: UUID,
+        wait: int,
+        *,
+        after: str | None = None,
+        current: str = "queued",
+    ) -> Turn:
+        """Long-poll one request for up to `wait` seconds.
+
+        Without `after`, return at a terminal state. With `after`, return once the request
+        leaves that state. At the deadline, return the current state. `current` is the
+        state the caller last saw, so the first relay call already waits.
+        """
+        loop = asyncio.get_running_loop()
+        until = loop.time() + wait
+        state = after or current
+        while True:
+            remaining = max(0, ceil(until - loop.time()))
             turn = await self.turn(
                 Inspect(
-                    conversation_id=turn.request.conversation_id,
-                    message_id=turn.request.id,
-                    after=turn.status,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    after=state,
                     wait=min(MAX_WAIT, remaining),
-                )
+                ),
+                until=until,
+            )
+            if (
+                turn.status not in ACTIVE
+                or (after is not None and turn.status != after)
+                or loop.time() >= until
+            ):
+                return turn
+            state = turn.status
+
+    async def status(
+        self,
+        conversation_id: UUID,
+        message_id: UUID | None = None,
+        *,
+        wait: int = 0,
+        after: str | None = None,
+    ) -> Turn:
+        """Read a request, or the latest one, and optionally wait as in wait_for."""
+        if wait and message_id is not None:
+            return await self.wait_for(conversation_id, message_id, wait, after=after)
+        turn = await self.turn(Inspect(conversation_id=conversation_id, message_id=message_id))
+        if wait and turn.status in ACTIVE and after in (None, turn.status):
+            turn = await self.wait_for(
+                conversation_id, turn.request.id, wait, after=after, current=turn.status
             )
         return turn
+
+    async def take(self, wait: int, claim_id: UUID, *, until: float | None = None) -> Turn | None:
+        try:
+            result = await self.call(Take(wait=wait, claim_id=claim_id), until=until)
+        except PigeonError as exc:
+            if exc.code != "invalid_frame":
+                raise
+            # A relay that predates claim IDs rejects the field. Its claims are not retried.
+            result = await self.call(Take(wait=wait), until=until)
+        return Turn.model_validate(result) if result else None
+
+    async def receive(self, wait: int, claim_id: UUID) -> Turn | None:
+        """Claim the next queued request, waiting up to `wait` seconds in relay-sized steps."""
+        loop = asyncio.get_running_loop()
+        until = loop.time() + wait
+        while True:
+            remaining = max(0, round(until - loop.time()))
+            turn = await self.take(min(MAX_WAIT, remaining), claim_id, until=until)
+            if turn is not None or remaining <= MAX_WAIT:
+                return turn
 
 
 async def ask_agent(
@@ -180,9 +280,10 @@ async def ask_agent(
                     wait=max(0, ceil(until - loop.time())),
                 )
         except PigeonError as exc:
+            # Client.call already retries storage errors on an open connection.
             if exc.code not in ("connection", "storage_unavailable"):
                 raise
-            if attempt == 2:
+            if attempt == 2 or exc.code == "storage_unavailable":
                 if submitted:
                     raise PigeonError(
                         exc.code,

@@ -103,11 +103,15 @@ def chat_share(
 
 
 def write_atomic(path: Path, text: str):
+    mode = path.stat().st_mode & 0o777 if path.exists() else None
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as handle:
         temporary = Path(handle.name)
         try:
             handle.write(text)
             handle.flush()
+            if mode is not None:
+                # Keep the permissions of a file another tool or the user created.
+                temporary.chmod(mode)
             temporary.replace(path)
         finally:
             temporary.unlink(missing_ok=True)

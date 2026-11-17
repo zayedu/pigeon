@@ -140,6 +140,10 @@ agent to check Pigeon.
   Pigeon, so the agent checks its inbox while it expects a message. For
   automatic wake in the terminal, open a Cursor CLI chat with
   `pigeon wake cursor`, adding its saved session ID to resume it.
+  If another tool removes the hook, Pigeon restores it once, keeps your other
+  hooks, and asks you to reload Cursor. A request the chat already claimed can
+  still be answered. If the hook keeps disappearing, ask whoever manages that
+  file to allow it.
 - **Antigravity CLI.** Setup installs the skill. If your chat lacks Pigeon’s
   MCP tools or a chat ID, open it with `pigeon antigravity` to supply both.
   Antigravity’s tool approval settings apply. Add the printed session ID to

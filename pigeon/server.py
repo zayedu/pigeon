@@ -198,12 +198,14 @@ def create_app(path: Path | None) -> FastAPI:
                     result = await storage(store.watch_activity, agent, frame, digest)
                     if result:
                         return result
-                else:
-                    operation = store.next_message if isinstance(frame, Watch) else store.take
-                    result = await storage(operation, agent)
+                elif isinstance(frame, Watch):
+                    result = await storage(store.next_message, agent)
                     if result:
-                        if isinstance(frame, Take):
-                            notify_turn(result)
+                        return result
+                else:
+                    result = await storage(store.take, agent, frame.claim_id)
+                    if result:
+                        notify_turn(result)
                         return result
                 remaining = until - monotonic()
                 if remaining <= 0:

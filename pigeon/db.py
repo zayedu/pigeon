@@ -123,6 +123,8 @@ MIGRATIONS = (
        WHERE status='queued'""",
     # Entries are (conversation_id, rowid), so history pages read in turn order.
     "CREATE INDEX IF NOT EXISTS turns_by_conversation ON turns(conversation_id)",
+    """CREATE INDEX IF NOT EXISTS turns_by_claim ON turns(claim_token)
+       WHERE claim_token IS NOT NULL""",
 )
 
 QUEUE_EXPIRED = "Deadline elapsed before the recipient claimed the request."
@@ -836,13 +838,21 @@ class Store:
         with self.transaction() as db:
             db.execute("DELETE FROM attachments WHERE expires_at<=?", (time.time(),))
 
-    def take(self, recipient: str) -> dict | None:
+    def take(self, recipient: str, claim_id=None) -> dict | None:
         now = time.time()
         with self.transaction() as db:
+            if claim_id is not None:
+                # A retry after an ambiguous failure gets the turn that claim already took.
+                row = db.execute(
+                    TURN + " WHERE t.claim_token=? AND COALESCE(t.recipient, c.recipient)=?",
+                    (str(claim_id), recipient),
+                ).fetchone()
+                if row:
+                    return render_turn(row)
             row = self.next_queued(db, recipient, now)
             if not row:
                 return None
-            token = secrets.token_hex(8)
+            token = str(claim_id) if claim_id else secrets.token_hex(8)
             # The queue deadline stops applying once the recipient claims the turn.
             updated = db.execute(
                 """UPDATE turns SET status='running', claimed_at=?, claim_token=?, deadline=?

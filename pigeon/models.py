@@ -32,6 +32,7 @@ RELAY_FEATURES = (
     "leases",
     "long_messages",
     "history",
+    "claim_ids",
 )
 Username = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")]
 
@@ -129,6 +130,8 @@ class Inspect(Frame):
 class Take(Frame):
     op: Literal["take"] = "take"
     wait: Annotated[int, Field(strict=True, ge=0, le=MAX_WAIT)] = MAX_WAIT
+    # Retrying with the same claim ID returns the turn it already claimed.
+    claim_id: UUID4 | None = None
 
 
 class Watch(Frame):

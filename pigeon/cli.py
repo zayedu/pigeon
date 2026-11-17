@@ -17,7 +17,7 @@ from typing import Annotated, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urldefrag
 from urllib.request import Request, urlopen
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import typer
 from pydantic import ValidationError
@@ -43,7 +43,6 @@ from .daemon import Daemon, Echo, Sessions
 from .db import open_store
 from .models import (
     ACTIVE,
-    MAX_WAIT,
     Cancel,
     Capabilities,
     Close,
@@ -52,7 +51,6 @@ from .models import (
     Finish,
     Grant,
     History,
-    Inspect,
     ListCalls,
     PigeonError,
     Ping,
@@ -60,8 +58,6 @@ from .models import (
     Renew,
     Signup,
     Status,
-    Take,
-    Turn,
     address,
     message_problem,
 )
@@ -351,8 +347,8 @@ def pigeon_command() -> list[str]:
     return [launcher] if launcher else [sys.executable, "-m", "pigeon.cli"]
 
 
-def cursor_hooks_path() -> Path:
-    return Path.home() / ".cursor" / "hooks.json"
+def cursor_hook_command() -> str:
+    return shlex.join([*pigeon_command(), "cursor-hook"])
 
 
 def skill_path(client: str) -> Path:
@@ -410,7 +406,7 @@ def refresh_skills():
         )
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         registered = False
-    if registered and not cursor.hook_installed(cursor_hooks_path()):
+    if registered and not cursor.hook_installed(cursor.hooks_path()):
         typer.echo("Run pigeon setup cursor again so Cursor chats can use Pigeon.")
 
 
@@ -793,10 +789,10 @@ def status(
     chat: Chat = None,
     pending: Annotated[bool, typer.Option(help="List only pending requests.")] = False,
     wait: Annotated[
-        int, typer.Option(min=0, max=600, help="Seconds to wait for the request to change.")
+        int, typer.Option(min=0, max=600, help="Seconds to wait for the request to finish.")
     ] = 0,
     after: Annotated[
-        Status | None, typer.Option(help="Wait while the request is in this state.")
+        Status | None, typer.Option(help="Return once the request leaves this state instead.")
     ] = None,
 ):
     """List recent conversations, or inspect and optionally wait on one request."""
@@ -812,12 +808,7 @@ def status(
 
     async def inspect():
         async with open_client(actor.relay, actor.token) as client:
-            turn = await client.turn(
-                Inspect(conversation_id=conversation_id, message_id=message_id)
-            )
-            if wait and (after is None or turn.status == after):
-                turn = await client.wait_for(turn, wait, until_terminal=False)
-            return turn
+            return await client.status(conversation_id, message_id, wait=wait, after=after)
 
     show(asyncio.run(inspect()))
 
@@ -855,16 +846,10 @@ def receive(ctx: typer.Context, chat: RequiredChat, wait: Wait = 0):
     actor = inspect_profile(setup_profile(ctx), chat)
 
     async def take():
-        until = time.monotonic() + wait
         async with open_client(actor.relay, actor.token) as client:
-            while True:
-                remaining = round(until - time.monotonic())
-                result = await client.call(Take(wait=max(0, min(MAX_WAIT, remaining))))
-                if result or remaining <= MAX_WAIT:
-                    return result
+            return await client.receive(wait, uuid4())
 
-    result = asyncio.run(take())
-    show(Turn.model_validate(result) if result else None)
+    show(asyncio.run(take()))
 
 
 @app.command()
@@ -932,7 +917,7 @@ def doctor(ctx: typer.Context, chat: str | None = None):
     if (Path.home() / ".cursor").is_dir():
         from . import cursor
 
-        ready = cursor.hook_installed(cursor_hooks_path()) and cursor.load_key(create=False)
+        ready = cursor.hook_installed(cursor.hooks_path()) and cursor.load_key(create=False)
         typer.echo(
             "Cursor chat identity hook: "
             + ("installed." if ready else "missing. Run pigeon setup cursor and reload Cursor.")
@@ -997,6 +982,7 @@ def mcp_server(
             claude_channel=claude_channel,
             cursor_endpoint=cursor_endpoint,
             cursor_chat=cursor,
+            cursor_hook_command=cursor_hook_command() if cursor else None,
             antigravity_session_file=antigravity_session_file,
             profile=ctx.obj,
         ).run(transport="stdio")
@@ -1021,7 +1007,7 @@ def register_mcp(path: Path, host: str, scope: str, *, name: str):
 
         register_cursor(Path.home() / ".cursor" / "mcp.json", name, [*command, "--cursor"])
         cursor.load_key(create=True)
-        cursor.register_hook(cursor_hooks_path(), shlex.join([*pigeon_command(), "cursor-hook"]))
+        cursor.register_hook(cursor.hooks_path(), cursor_hook_command())
         typer.echo("Reload Cursor to load Pigeon and its chat identity hook.")
         return
     binary = shutil.which(host)

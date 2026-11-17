@@ -25,6 +25,54 @@ UNBOUND = (
     "Pigeon cannot identify this Cursor chat. Run pigeon setup cursor, reload Cursor, "
     "and retry. Pigeon will not use your account instead."
 )
+FORGED = (
+    "This call's chat_binding was not signed by Pigeon's Cursor hook on this machine. "
+    "Leave chat_binding unset. The hook fills it in."
+)
+# Recovery for a request already claimed when the hook stops running.
+CLAIMED = (
+    " To finish a request this chat already claimed, pass the claim token from "
+    "pigeon_receive to pigeon_answer or pigeon_extend."
+)
+# Error codes for a call that arrived without a binding. A claim token can still
+# authorize finishing that chat's claimed request.
+UNBOUND_CODES = frozenset({"chat_unbound", "hook_restored", "hook_removed"})
+
+
+def hooks_path() -> Path:
+    return Path.home() / ".cursor" / "hooks.json"
+
+
+def missing_binding(command: str | None, *, may_repair: bool) -> PigeonError:
+    """Explain a call without a binding, restoring a removed hook if allowed."""
+    path = hooks_path()
+    if hook_installed(path):
+        return PigeonError(
+            "chat_unbound",
+            "Pigeon's Cursor hook is installed but did not run for this call. "
+            "Reload Cursor, then retry." + CLAIMED,
+        )
+    if command is None or not may_repair:
+        # Rewriting a file another tool keeps resetting would only fight that tool.
+        return PigeonError(
+            "hook_removed",
+            f"Pigeon's hook was removed from {path} again after Pigeon restored it, so "
+            "Pigeon will not rewrite it. If a device-management tool manages that file, "
+            "ask its owner to allow Pigeon's preToolUse hook." + CLAIMED,
+        )
+    try:
+        register_hook(path, command)
+    except PigeonError as exc:
+        return PigeonError(
+            "hook_removed",
+            f"Pigeon's hook is missing from {path} and could not be restored: {exc} "
+            "Run pigeon setup cursor." + CLAIMED,
+        )
+    return PigeonError(
+        "hook_restored",
+        f"Something removed Pigeon's hook from {path}. Pigeon restored it and kept your "
+        "other hooks. Reload Cursor so calls carry this chat's identity again." + CLAIMED,
+    )
 
 
 def key_path() -> Path:
@@ -66,7 +114,7 @@ def verify(binding: str) -> str:
         or not CONVERSATION.fullmatch(conversation_id)
         or not hmac.compare_digest(sign(conversation_id, key), binding)
     ):
-        raise PigeonError("chat_binding", UNBOUND)
+        raise PigeonError("chat_binding_invalid", FORGED)
     return conversation_id
 
 
@@ -103,8 +151,9 @@ def hook_entry(command: str) -> dict:
 
 def register_hook(path: Path, command: str):
     with config_lock(path):
+        original = path.read_bytes() if path.exists() else None
         try:
-            settings = json.loads(path.read_text()) if path.exists() else {"version": 1}
+            settings = json.loads(original) if original is not None else {"version": 1}
         except ValueError:
             raise PigeonError("invalid_config", f"Fix the JSON in {path}, then retry.") from None
         hooks = settings.get("hooks", {}) if isinstance(settings, dict) else None
@@ -118,6 +167,9 @@ def register_hook(path: Path, command: str):
             return
         settings.setdefault("version", 1)
         settings.setdefault("hooks", {})["preToolUse"] = kept + [entry]
+        # Another tool may write without Pigeon's lock. Do not replace its newer copy.
+        if (path.read_bytes() if path.exists() else None) != original:
+            raise PigeonError("invalid_config", f"{path} changed while Pigeon was updating it.")
         write_atomic(path, json.dumps(settings, indent=2) + "\n")
 
 

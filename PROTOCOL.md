@@ -24,7 +24,7 @@ Some errors add a `data` object with structured details. Clients that predate
 | `submit` | UUIDv4 `conversation_id`, UUIDv4 `message_id`, recipient `to`, `message`, optional `context`, and optional queue `timeout` in seconds (1–900, default 300) |
 | `status` | `conversation_id`, optional `message_id`, optional last observed state in `after`, and optional `wait` (0–20 seconds, default 0) |
 | `list` | None. Returns metadata for up to 50 recent conversations involving the authenticated agent |
-| `take` | Optional `wait` (0–20 seconds, default 20). Claims the oldest pending turn for the authenticated recipient or returns null |
+| `take` | Optional `wait` (0–20 seconds, default 20) and optional UUIDv4 `claim_id`. Claims the oldest pending turn for the authenticated recipient or returns null |
 | `finish` | `message_id`, `status` (`completed`, `failed`, or `timed_out`), and `content`. Only the recipient can finish a claimed turn |
 | `renew` | `message_id`. The recipient extends the execution lease of a turn it claimed. Returns the turn |
 | `history` | `conversation_id`, optional `limit` (1–50, default 20), and optional `before` from the previous page. Returns `turns` newest first and the next `before`, or null |
@@ -107,14 +107,23 @@ including after `close`.
 Retry an ambiguous submission with the original message ID and payload.
 Repeat a result submission with the original message ID if the connection
 drops before the reply. After claiming a request, the worker owns that turn
-until completion, cancellation, or timeout. A lost claim reply can leave the
-execution outcome uncertain. The relay will not issue a second claim.
+until completion, cancellation, or timeout. The relay will not issue a second
+claim for a turn.
+
+A `storage_unavailable` error can follow a write that committed, because hosted
+storage may lose its reply. Retrying a frame keyed by message, conversation, or
+sender is safe. A `take` is not, unless it carries a `claim_id`. The relay
+records the ID with the claim, and a repeated `take` with the same ID returns
+that turn instead of claiming another. Use a new ID for each claim attempt and
+reuse it only to retry that attempt. Without a `claim_id`, a lost claim reply
+leaves the turn running until its lease expires. Clients omit unset optional
+fields, so relays from before a field accept the frame.
 
 Optional features are advertised in the `ping` response's `features` list.
 Treat an absent list as protocol v1 baseline support. Current relays list
 `attachments`, `peer_capabilities`, `activity_watch`, `leases`,
-`long_messages`, and `history`. Older relays reject `renew` and `history` as
-invalid frames. The wake advertisement expires after 60 seconds without a
+`long_messages`, `history`, and `claim_ids`. Older relays reject `renew`,
+`history`, and a `take` with `claim_id` as invalid frames. The wake advertisement expires after 60 seconds without a
 heartbeat. Other capabilities describe
 support advertised by the chat, including when it is offline. Only an open
 invitation session exposes a peer's features. Omit the conversation ID to

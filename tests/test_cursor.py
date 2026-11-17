@@ -13,6 +13,7 @@ from mcp.client.stdio import stdio_client
 
 from pigeon.client import open_client
 from pigeon.config import Config, save
+from pigeon.cursor import hook_installed
 from pigeon.models import Capabilities, Finish, Inspect, PigeonError, Redeem, Submit, Take
 
 
@@ -125,6 +126,7 @@ def test_cursor_desktop_chats_have_isolated_resumable_inboxes(relay, tmp_path):
     profile = tmp_path / "config" / "pigeon" / "config.json"
     save(profile, Config(relay=relay.url, agent="@alice/codex", token=relay.alice))
     environment = os.environ | {
+        "HOME": str(tmp_path),
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
         # Inherited from a terminal. Cursor mode must not treat it as a chat identity.
         "CLAUDE_CODE_SESSION_ID": str(uuid4()),
@@ -157,9 +159,12 @@ def test_cursor_desktop_chats_have_isolated_resumable_inboxes(relay, tmp_path):
         ):
             await cursor.initialize()
             unbound = await cursor.call_tool("pigeon_share", {})
-            assert unbound.isError and "Cursor chat" in unbound.content[0].text
+            assert unbound.isError and "Pigeon restored it" in unbound.content[0].text
+            assert hook_installed(tmp_path / ".cursor" / "hooks.json")
+            unbound = await cursor.call_tool("pigeon_share", {})
+            assert unbound.isError and "did not run for this call" in unbound.content[0].text
             forged = await cursor.call_tool("pigeon_share", {"chat_binding": first_chat})
-            assert forged.isError
+            assert forged.isError and "not signed" in forged.content[0].text
 
             sessions = {}
             for chat in (first_chat, second_chat):
@@ -211,6 +216,7 @@ def test_cursor_desktop_chats_have_isolated_resumable_inboxes(relay, tmp_path):
             assert [
                 row["conversation_id"] for row in listed.structuredContent["result"]["sessions"]
             ] == [sessions[first_chat]["conversation_id"]]
+            assert listed.structuredContent["result"]["chat"] == f"cursor:{first_chat}"
             extended = await call(
                 cursor, first_chat, "pigeon_extend", {"message_id": str(request.message_id)}
             )
@@ -254,6 +260,7 @@ def test_cursor_desktop_chats_have_isolated_resumable_inboxes(relay, tmp_path):
 
 
 def test_sender_follows_a_slow_peer_with_long_polling(relay, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     profile = tmp_path / "config" / "pigeon" / "config.json"
     save(profile, Config(relay=relay.url, agent="@alice/codex", token=relay.alice))
@@ -296,12 +303,14 @@ def test_sender_follows_a_slow_peer_with_long_polling(relay, tmp_path, monkeypat
             work = asyncio.create_task(peer_works())
             loop = asyncio.get_running_loop()
             started = loop.time()
-            running = await cursor.call_tool("pigeon_status", bind(chat, "pigeon_status", follow))
+            # An explicit after returns on the transition.
+            running = await cursor.call_tool(
+                "pigeon_status", bind(chat, "pigeon_status", follow | {"after": "queued"})
+            )
             assert running.structuredContent["result"]["status"] == "running"
             assert 0.5 < loop.time() - started < 10
-            done = await cursor.call_tool(
-                "pigeon_status", bind(chat, "pigeon_status", follow | {"after": "running"})
-            )
+            # Without after, one call waits through the claim to the answer.
+            done = await cursor.call_tool("pigeon_status", bind(chat, "pigeon_status", follow))
             assert done.structuredContent["result"]["status"] == "completed"
             assert done.structuredContent["result"]["response"]["content"] == "Done"
             assert loop.time() - started < 15
