@@ -54,7 +54,7 @@ async def native_codex_wake(metadata: object) -> Callable[[], Awaitable[None]] |
                     {
                         "id": 1,
                         "method": "initialize",
-                        "params": {"clientInfo": {"name": "pigeon", "version": "0.1.0"}},
+                        "params": {"clientInfo": {"name": "pigeon", "version": "0.2.0"}},
                     }
                 )
             )
