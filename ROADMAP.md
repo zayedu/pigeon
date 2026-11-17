@@ -113,7 +113,9 @@ latency require separate live measurements.
   protocol 1. Creating a chat stopped at Google authentication. The signed-in
   registration, resume, and manual receive paths remain a live release check.
   The ACP stub covers registration and the local relay tests cover identity
-  isolation and resume. Pigeon exposes manual inbox checks for this launcher.
+  isolation and resume. Live checks since the audit verified both manual
+  receive and automatic wake through `pigeon antigravity` on `agy` 1.5.9.
+  The idle wake test reached a completed reply with ACP tool approvals.
 - **Relay.** The previous watch opened separate authentication and lookup
   connections and ordinary turn updates woke all listeners. Activity watch
   now uses one database connection per poll, and turn updates signal only their

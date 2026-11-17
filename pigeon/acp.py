@@ -3,7 +3,7 @@ import json
 import os
 import sys
 import tempfile
-from contextlib import AsyncExitStack, suppress
+from contextlib import suppress
 from pathlib import Path
 
 from .models import PigeonError
@@ -152,11 +152,7 @@ async def run_acp(binary: str, profile: Path, session_id: str | None, *, antigra
     with tempfile.TemporaryDirectory(prefix="pigeon-", dir="/tmp") as directory:
         endpoint = str(Path(directory) / "wake.sock")
         session_file = Path(endpoint).with_suffix(".session")
-        async with AsyncExitStack() as stack:
-            if not antigravity:
-                await stack.enter_async_context(
-                    await asyncio.start_unix_server(enqueue_wake, path=endpoint)
-                )
+        async with await asyncio.start_unix_server(enqueue_wake, path=endpoint):
             proc = await asyncio.create_subprocess_exec(
                 binary,
                 "acp",

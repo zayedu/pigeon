@@ -43,7 +43,7 @@ from .wake import (
     listen,
     native_claude_wake,
     native_codex_wake,
-    notify_cursor,
+    notify_acp,
     queue_codex,
 )
 
@@ -417,14 +417,16 @@ def create_mcp(
                 if codex_wake is not None:
                     notify = partial(queue_codex, *codex_wake)
                 elif cursor_endpoint is not None:
-                    notify = partial(notify_cursor, cursor_endpoint)
+                    notify = partial(notify_acp, cursor_endpoint)
                 elif claude_channel:
                     notify = partial(
                         ctx.session.send_notification,
                         ClaudeWakeNotification(params={"content": WAKE_PROMPT}),
                     )
                 elif antigravity_session_file is not None:
-                    pass
+                    endpoint = antigravity_session_file.with_suffix(".sock")
+                    if endpoint.is_socket():
+                        notify = partial(notify_acp, str(endpoint))
                 elif isinstance(codex, dict):
                     notify = await native_codex_wake(codex)
                 else:

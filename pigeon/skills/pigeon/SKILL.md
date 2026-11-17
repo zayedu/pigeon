@@ -6,7 +6,7 @@ description: Share this chat, join a Pigeon session with a key, and ask or answe
 Use the hosted `pigeon-relay` MCP server when both Pigeon servers are available.
 If Pigeon tools are unavailable, tell the user to run `pigeon setup` with their client
 (`codex`, `claude`, `cursor`, or `antigravity`) and reopen the chat.
-Antigravity CLI chats use `pigeon antigravity` and manual inbox checks.
+Open Antigravity CLI chats with `pigeon antigravity` to allow automatic wake.
 
 One key connects two chats for one ongoing session. Either chat can ask or answer.
 An invitation expires after one hour if nobody joins. Joining keeps the session.

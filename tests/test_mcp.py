@@ -440,6 +440,8 @@ assert sys.argv[1:] == ["acp"]
 for line in sys.stdin:
     frame = json.loads(line)
     if frame["method"] == "session/resume":
+        session_file = Path(frame["params"]["mcpServers"][0]["args"][-1])
+        assert session_file.with_suffix(".sock").is_socket()
         Path({str(tmp_path / "resume.json")!r}).write_text(json.dumps(frame["params"]))
     print(json.dumps({{"jsonrpc": "2.0", "id": frame["id"], "result": {{}}}}), flush=True)
 """
@@ -504,6 +506,50 @@ def test_antigravity_inboxes_are_distinct_and_resumable(relay, tmp_path):
     chat = f"antigravity:{first.read_text()}"
     result = run_cli(profile, "status", "--chat", chat)
     assert first_address in result.stdout
+
+
+def test_antigravity_mcp_notifies_its_launcher_without_manual_receive(relay, tmp_path):
+    from tempfile import TemporaryDirectory
+
+    profile = tmp_path / "agy.json"
+    run_cli(profile, "login", relay.url, "--token-stdin", token=relay.alice)
+
+    async def exchange(root):
+        session_file = root / "wake.session"
+        session_file.write_text(str(uuid4()))
+        woke = asyncio.Event()
+
+        async def notify(_reader, writer):
+            writer.write(b"1")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            woke.set()
+
+        command, *args = cli(profile, "mcp", "--antigravity-session-file", str(session_file))
+        async with (
+            asyncio.timeout(8),
+            await asyncio.start_unix_server(notify, path=session_file.with_suffix(".sock")),
+            stdio_client(StdioServerParameters(command=command, args=args)) as streams,
+            ClientSession(*streams) as mcp,
+            open_client(relay.url, relay.bob) as peer,
+        ):
+            await mcp.initialize()
+            share = await mcp.call_tool("pigeon_share", {})
+            assert share.structuredContent["wake"]["attached"]
+            joined = await peer.call(
+                Redeem(key=share.structuredContent["result"], peer_session=True)
+            )
+            await peer.ask(
+                joined["address"],
+                "Wake agy",
+                conversation_id=UUID(joined["conversation_id"]),
+                wait=0,
+            )
+            await woke.wait()
+
+    with TemporaryDirectory(prefix="pigeon-agy-test-", dir="/tmp") as directory:
+        asyncio.run(exchange(Path(directory)))
 
 
 def test_shared_chat_wakes_without_calling_receive(relay, tmp_path):

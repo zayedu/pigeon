@@ -115,12 +115,12 @@ async def queue_codex(binary: str, thread: UUID, endpoint: str):
             await proc.wait()
 
 
-async def notify_cursor(endpoint: str):
+async def notify_acp(endpoint: str):
     async with asyncio.timeout(5):
         reader, writer = await asyncio.open_unix_connection(endpoint)
         try:
             if await reader.read(1) != b"1":
-                raise PigeonError("wake_failed", "Cursor rejected the wake request.")
+                raise PigeonError("wake_failed", "The agent launcher rejected the wake request.")
         finally:
             writer.close()
             await writer.wait_closed()
