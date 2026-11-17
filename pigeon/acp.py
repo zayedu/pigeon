@@ -168,7 +168,7 @@ async def run_acp(binary: str, profile: Path, session_id: str | None, *, antigra
                     {
                         "protocolVersion": 1,
                         "clientCapabilities": {},
-                        "clientInfo": {"name": "pigeon", "version": "0.2.0"},
+                        "clientInfo": {"name": "pigeon", "version": "0.2.1"},
                     },
                 )
                 if not antigravity:
