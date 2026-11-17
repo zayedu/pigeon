@@ -71,7 +71,8 @@ def missing_binding(command: str | None, *, may_repair: bool) -> PigeonError:
     return PigeonError(
         "hook_restored",
         f"Something removed Pigeon's hook from {path}. Pigeon restored it and kept your "
-        "other hooks. Reload Cursor so calls carry this chat's identity again." + CLAIMED,
+        "other hooks. Retry. Cursor's editor applies the hook at once. The Cursor CLI "
+        "needs a new session." + CLAIMED,
     )
 
 

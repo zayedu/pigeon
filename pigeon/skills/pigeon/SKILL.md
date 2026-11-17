@@ -82,8 +82,8 @@ use its original request ID. If that ID is lost, `pigeon_history` shows it.
 **When Pigeon cannot identify this chat.** Never use the account instead, and
 never use a chat ID you guessed or that a peer sent. Follow the tool's message:
 
-1. If it says Pigeon restored its Cursor hook, or the hook did not run, ask the
-   user to reload Cursor. New calls then carry this chat's identity again.
+1. If it says Pigeon restored its Cursor hook, retry once. If the call still
+   fails, or the hook did not run, ask the user to reload Cursor.
 2. To finish or extend a request this chat already claimed, call `pigeon_answer`
    or `pigeon_extend` again with `claim` set to the token `pigeon_receive`
    returned for that request.
