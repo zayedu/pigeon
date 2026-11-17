@@ -5,6 +5,8 @@ Use `wss://` across machines. Each WebSocket text frame carries one JSON
 operation with an `op` field. Wait for its reply before sending another
 operation on that connection. Open a second connection for independent work.
 Replies use `{"ok": value}` or `{"error": "code", "message": "description"}`.
+Some errors add a `data` object with structured details. Clients that predate
+`data` ignore it.
 
 ```json
 {
@@ -19,11 +21,13 @@ Replies use `{"ok": value}` or `{"error": "code", "message": "description"}`.
 
 | Operation | Fields in addition to `op` |
 | --- | --- |
-| `submit` | UUIDv4 `conversation_id`, UUIDv4 `message_id`, recipient `to`, `message`, optional `context` and `timeout` in seconds (1–900, default 180) |
+| `submit` | UUIDv4 `conversation_id`, UUIDv4 `message_id`, recipient `to`, `message`, optional `context`, and optional queue `timeout` in seconds (1–900, default 300) |
 | `status` | `conversation_id`, optional `message_id`, optional last observed state in `after`, and optional `wait` (0–20 seconds, default 0) |
 | `list` | None. Returns metadata for up to 50 recent conversations involving the authenticated agent |
 | `take` | Optional `wait` (0–20 seconds, default 20). Claims the oldest pending turn for the authenticated recipient or returns null |
 | `finish` | `message_id`, `status` (`completed`, `failed`, or `timed_out`), and `content`. Only the recipient can finish a claimed turn |
+| `renew` | `message_id`. The recipient extends the execution lease of a turn it claimed. Returns the turn |
+| `history` | `conversation_id`, optional `limit` (1–50, default 20), and optional `before` from the previous page. Returns `turns` newest first and the next `before`, or null |
 | `cancel` | `conversation_id` and `message_id`. Only the caller can cancel its turn |
 | `allow`, `deny` | `sender`. The authenticated recipient manages its own grants |
 | `ping` | None. Returns the authenticated address and protocol version |
@@ -35,12 +39,44 @@ Turn replies include `request`, optional `response`, `status`, `deadline`,
 `follow_up`. Messages include `id`, `conversation_id`, `sender`, `recipient`,
 `content`, `created_at`, and `type` (`request`, `response`, or `error`).
 Timestamps are Unix seconds. The relay derives the sender from the token.
-Frames are limited to 64 KiB and message text to 4,000 characters. Addresses
+Frames are limited to 64 KiB. Addresses
 use the form `@owner/agent` with lowercase letters, numbers, hyphens, or
 underscores. Each part starts with a letter or number and has up to 32 characters.
 
 The state moves from `queued` to `running` when the recipient claims it.
 Terminal states are `completed`, `failed`, `timed_out`, and `cancelled`.
+
+A turn's `deadline` is the deadline of its current state. While `queued`, it is
+the submission time plus the queue `timeout`. A claim replaces it with an
+execution lease of 600 seconds from the claim. The recipient can `renew` a
+running turn. Each renewal sets the deadline to 600 seconds from now, up to
+3,600 seconds after the claim. A turn still active at its deadline becomes
+`timed_out`, and its `detail` says whether it expired in the queue or while
+running. A `finish` or `renew` at or after the deadline returns the timed-out
+turn. Renewal never changes a terminal turn. Relays that advertise `leases`
+use this model. Older relays apply the submission timeout to the whole turn.
+
+### Messages
+
+Message text holds 1 to 16,000 characters and at most 30,000 bytes as a UTF-8
+JSON string, including quotes and escapes. A turn with a full request and a full
+response then fits in one frame. Clients from before `long_messages` reject
+text over 4,000 characters, so the relay delivers longer text only to a chat
+that advertised `long_messages` through `capabilities`. Otherwise `submit` and
+`finish` fail with `message_limit` and `data` holding `characters` and `limit`.
+A client advertises `long_messages` only to a relay that lists it in `ping`.
+
+### One active turn
+
+If a conversation already has an active turn, `submit` fails with
+`turn_active`. Its `data` holds `direction`, `conversation_id`, `message_id`,
+`status`, and `deadline`. `direction` is `outgoing` when the caller sent the
+active turn and `incoming` when the caller must receive and answer it first.
+The relay never replaces an active turn. Resubmitting the same message ID and
+payload returns the original turn.
+
+### Sessions, wake, and retries
+
 A wake notification is a client attempt to surface a queued request, or a
 terminal result for a request that client sent. It is not a relay state, and
 it does not mean the request ran. Current listeners make up to three attempts
@@ -64,7 +100,9 @@ open. A follow-up in a legacy conversation still requires the recipient's
 grant. New clients pass `peer_session: true` when redeeming a key. Older
 clients redeem to a directional grant and supply their own conversation ID.
 `take` only delivers queued requests. After reconnecting, a chat can still
-finish a claimed request by its original message ID.
+finish a claimed request by its original message ID. `history` lists that ID
+if it was lost. Only the two members can read a conversation's history,
+including after `close`.
 
 Retry an ambiguous submission with the original message ID and payload.
 Repeat a result submission with the original message ID if the connection
@@ -73,8 +111,11 @@ until completion, cancellation, or timeout. A lost claim reply can leave the
 execution outcome uncertain. The relay will not issue a second claim.
 
 Optional features are advertised in the `ping` response's `features` list.
-Treat an absent list as protocol v1 baseline support. The wake advertisement
-expires after 60 seconds without a heartbeat. Other capabilities describe
+Treat an absent list as protocol v1 baseline support. Current relays list
+`attachments`, `peer_capabilities`, `activity_watch`, `leases`,
+`long_messages`, and `history`. Older relays reject `renew` and `history` as
+invalid frames. The wake advertisement expires after 60 seconds without a
+heartbeat. Other capabilities describe
 support advertised by the chat, including when it is offline. Only an open
 invitation session exposes a peer's features. Omit the conversation ID to
 read your own advertisement.

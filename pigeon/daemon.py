@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import sqlite3
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import closing, suppress
 from dataclasses import dataclass
@@ -9,10 +10,11 @@ from typing import Protocol
 from uuid import uuid4
 
 from .client import open_client
-from .models import MAX_TEXT, Finish, Inspect, PigeonError, Ping, Take, Turn
+from .models import LEASE, LEGACY_TEXT, Finish, Inspect, PigeonError, Ping, Renew, Take, Turn
 
 log = logging.getLogger(__name__)
 RETRYABLE = {"connection", "storage_unavailable", "rate_limited"}
+OBSERVE_WAIT = 20
 
 
 class Runtime(Protocol):
@@ -78,7 +80,10 @@ class Daemon:
                 delay = min(5, delay * 2)
 
     async def watch(self, turn: Turn):
+        renew = True
+
         async def observe():
+            nonlocal renew
             async with open_client(self.relay, self.token) as client:
                 while True:
                     updated = await client.turn(
@@ -86,11 +91,19 @@ class Daemon:
                             conversation_id=turn.request.conversation_id,
                             message_id=turn.request.id,
                             after="running",
-                            wait=20,
+                            wait=OBSERVE_WAIT,
                         )
                     )
                     if updated.status != "running":
                         return
+                    if renew and updated.deadline - time.time() < LEASE / 2:
+                        try:
+                            await client.call(Renew(message_id=turn.request.id))
+                        except PigeonError as exc:
+                            # Relays without leases keep the submission deadline.
+                            if exc.code != "invalid_frame":
+                                raise
+                            renew = False
 
         await self.retry(observe)
 
@@ -98,7 +111,7 @@ class Daemon:
         request = turn.request
 
         def result(status, content):
-            return Finish(message_id=request.id, status=status, content=content[:MAX_TEXT])
+            return Finish(message_id=request.id, status=status, content=content[:LEGACY_TEXT])
 
         conversation_id = str(request.conversation_id)
         try:

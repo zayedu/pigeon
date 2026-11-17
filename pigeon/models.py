@@ -1,18 +1,66 @@
+import json
 from typing import Annotated, Literal
 from urllib.parse import quote
 
-from pydantic import UUID4, BaseModel, ConfigDict, Field, TypeAdapter, field_validator
+from pydantic import (
+    UUID4,
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    field_validator,
+)
 
 MAX_FRAME = 64 * 1024
-MAX_TEXT = 4_000
+# Older clients validate messages against 4,000 characters, so the relay only
+# delivers longer text to chats that advertise "long_messages".
+LEGACY_TEXT = 4_000
+MAX_TEXT = 16_000
+# A turn carries a request and a response. Two encoded messages plus framing
+# must fit in one 64 KiB WebSocket frame.
+MAX_TEXT_BYTES = 30_000
 MAX_WAIT = 20
+QUEUE_TIMEOUT = 300
+LEASE = 600
+MAX_RUN = 3_600
 MAX_ATTACHMENT = 1024 * 1024
-RELAY_FEATURES = ("attachments", "peer_capabilities", "activity_watch")
+RELAY_FEATURES = (
+    "attachments",
+    "peer_capabilities",
+    "activity_watch",
+    "leases",
+    "long_messages",
+    "history",
+)
 Username = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")]
 
 Address = Annotated[str, Field(pattern=r"^@[a-z0-9][a-z0-9_-]{0,31}/[a-z0-9][a-z0-9_-]{0,31}$")]
 address = TypeAdapter(Address)
-Content = Annotated[str, Field(min_length=1, max_length=MAX_TEXT)]
+
+
+def encoded_size(text: str) -> int:
+    return len(json.dumps(text, ensure_ascii=False).encode())
+
+
+def message_problem(text: str, limit: int = MAX_TEXT) -> str | None:
+    size = encoded_size(text)
+    if text and len(text) <= limit and size <= MAX_TEXT_BYTES:
+        return None
+    return (
+        f"The message has {len(text):,} characters and encodes to {size:,} bytes. "
+        f"The limit is {limit:,} characters and {MAX_TEXT_BYTES:,} encoded bytes. "
+        "Split it into several turns or share a link."
+    )
+
+
+def check_content(text: str) -> str:
+    if problem := message_problem(text):
+        raise ValueError(problem)
+    return text
+
+
+Content = Annotated[str, Field(min_length=1, max_length=MAX_TEXT), AfterValidator(check_content)]
 Status = Literal["queued", "running", "completed", "failed", "cancelled", "timed_out"]
 ACTIVE = ("queued", "running")
 Repository = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$")]
@@ -66,7 +114,8 @@ class Submit(Frame):
     to: Address
     message: Content
     context: Context | None = None
-    timeout: Annotated[int, Field(strict=True, ge=1, le=900)] = 180
+    # Seconds the request may wait before the recipient claims it.
+    timeout: Annotated[int, Field(strict=True, ge=1, le=900)] = QUEUE_TIMEOUT
 
 
 class Inspect(Frame):
@@ -99,7 +148,8 @@ class Capabilities(Frame):
     conversation_id: UUID4 | None = None
     features: (
         Annotated[
-            list[Literal["wake", "attachments", "websocket", "manual_inbox"]], Field(max_length=4)
+            list[Literal["wake", "attachments", "websocket", "manual_inbox", "long_messages"]],
+            Field(max_length=8),
         ]
         | None
     ) = None
@@ -110,6 +160,18 @@ class Finish(Frame):
     message_id: UUID4
     status: Literal["completed", "failed", "timed_out"]
     content: Content
+
+
+class Renew(Frame):
+    op: Literal["renew"] = "renew"
+    message_id: UUID4
+
+
+class History(Frame):
+    op: Literal["history"] = "history"
+    conversation_id: UUID4
+    before: Annotated[int, Field(strict=True, ge=1)] | None = None
+    limit: Annotated[int, Field(strict=True, ge=1, le=50)] = 20
 
 
 class Cancel(Frame):
@@ -171,6 +233,8 @@ Command = (
     | Watch
     | ActivityWatch
     | Capabilities
+    | Renew
+    | History
 )
 command = TypeAdapter(Annotated[Command, Field(discriminator="op")])
 
@@ -197,6 +261,7 @@ class Turn(Frame):
 
 
 class PigeonError(Exception):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, data: dict | None = None):
         super().__init__(message)
         self.code = code
+        self.data = data

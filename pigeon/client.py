@@ -11,6 +11,7 @@ from websockets.exceptions import InvalidStatus, WebSocketException
 
 from .models import (
     ACTIVE,
+    LEGACY_TEXT,
     MAX_FRAME,
     MAX_WAIT,
     Command,
@@ -90,7 +91,14 @@ class Client:
                 await self.socket.close()
                 raise
         if "error" in response:
-            raise PigeonError(response["error"], response["message"])
+            text = getattr(request, "message", None) or getattr(request, "content", None)
+            if response["error"] == "invalid_frame" and len(text or "") > LEGACY_TEXT:
+                raise PigeonError(
+                    "message_limit",
+                    f"This relay accepts at most {LEGACY_TEXT:,} characters per message. "
+                    "Split the message.",
+                )
+            raise PigeonError(response["error"], response["message"], response.get("data"))
         return response["ok"]
 
     async def turn(self, request: Submit | Inspect) -> Turn:
@@ -115,8 +123,13 @@ class Client:
                 message_id=message_id or uuid4(),
             )
         )
+        return await self.wait_for(turn, wait)
+
+    async def wait_for(self, turn: Turn, wait: int, *, until_terminal: bool = True) -> Turn:
+        """Long-poll one turn. Stop at a terminal state or, if not until_terminal, any change."""
+        start = turn.status
         until = asyncio.get_running_loop().time() + wait
-        while turn.status in ACTIVE:
+        while turn.status in ACTIVE and (until_terminal or turn.status == start):
             remaining = ceil(until - asyncio.get_running_loop().time())
             if remaining <= 0:
                 break

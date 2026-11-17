@@ -51,7 +51,8 @@ def test_protocol_validation():
         {"conversation_id": "abc"},
         {"to": "https://example.org"},
         {"message": ""},
-        {"message": "x" * 4001},
+        {"message": "x" * 16_001},
+        {"message": "\U0001f600" * 8_000},
         {"context": {"type": "github_pr", "repo": "../project", "number": 42}},
         {"context": {"type": "github_pr", "repo": "alice/..", "number": 42}},
         {"context": {"type": "github_pr", "repo": "alice/project", "number": "42"}},
@@ -442,7 +443,16 @@ def test_simultaneous_follow_ups_do_not_both_land(relay):
 
         results = await asyncio.gather(send("One"), send("Two"))
         assert sum(isinstance(item, PigeonError) for item in results) == 1
-        assert any(getattr(item, "code", None) == "conflict" for item in results)
+        [error] = [item for item in results if isinstance(item, PigeonError)]
+        [accepted] = [item for item in results if not isinstance(item, PigeonError)]
+        assert error.code == "turn_active"
+        assert error.data == {
+            "direction": "outgoing",
+            "conversation_id": str(conversation_id),
+            "message_id": str(accepted.request.id),
+            "status": "queued",
+            "deadline": accepted.deadline,
+        }
 
     asyncio.run(exchange())
 

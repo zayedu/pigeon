@@ -130,7 +130,8 @@ def test_daemon_limits_concurrency_and_interrupts_on_cancel(relay, tmp_path):
                     ALICE, "Too early", conversation_id=first.request.conversation_id, wait=0
                 )
             except PigeonError as exc:
-                assert exc.code == "conflict"
+                assert exc.code == "turn_active"
+                assert exc.data["direction"] == "outgoing"
             else:
                 raise AssertionError("Concurrent follow-up accepted.")
             second = await caller.ask(ALICE, "Wait too", wait=0)
@@ -168,8 +169,40 @@ def test_local_timeout_and_offline_deadline(relay, tmp_path):
             )
             expired = await asyncio.wait_for(terminal(caller, offline), 4)
             assert expired.status == "timed_out"
-            assert "before a daemon accepted" in expired.detail
+            assert "before the recipient claimed" in expired.detail
         async with open_client(relay.url, relay.alice) as receiver:
             assert await receiver.call(Take(wait=0)) is None
+
+    asyncio.run(exchange())
+
+
+def test_daemon_renews_its_lease_while_the_runtime_works(relay, tmp_path, monkeypatch):
+    monkeypatch.setattr("pigeon.daemon.OBSERVE_WAIT", 0)
+    # Treat the relay's 600-second lease as nearly spent so the daemon renews it.
+    monkeypatch.setattr("pigeon.daemon.LEASE", 2_000)
+
+    async def exchange():
+        await allow(relay)
+        runtime = BlockingRuntime()
+        daemon = daemon_for(relay, tmp_path, runtime)
+        async with running(daemon), open_client(relay.url, relay.bob) as caller:
+            first = await caller.ask(ALICE, "Think for a while", wait=0)
+            await asyncio.wait_for(runtime.started.get(), 3)
+            claimed = await caller.turn(
+                Inspect(conversation_id=first.request.conversation_id, message_id=first.request.id)
+            )
+            for _ in range(50):
+                await asyncio.sleep(0.05)
+                current = await caller.turn(
+                    Inspect(
+                        conversation_id=first.request.conversation_id, message_id=first.request.id
+                    )
+                )
+                if current.deadline > claimed.deadline:
+                    break
+            assert current.status == "running"
+            assert current.deadline > claimed.deadline
+            runtime.release.set()
+            assert (await asyncio.wait_for(terminal(caller, first), 4)).status == "completed"
 
     asyncio.run(exchange())

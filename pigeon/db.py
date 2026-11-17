@@ -10,12 +10,18 @@ from uuid import uuid4
 
 from .models import (
     ACTIVE,
+    LEASE,
+    LEGACY_TEXT,
     MAX_ATTACHMENT,
+    MAX_FRAME,
+    MAX_RUN,
     ActivityWatch,
     Cancel,
     Finish,
+    History,
     Inspect,
     PigeonError,
+    Renew,
     Submit,
     address,
 )
@@ -115,14 +121,19 @@ MIGRATIONS = (
     "ALTER TABLE turns ADD COLUMN claim_token TEXT",
     """CREATE INDEX IF NOT EXISTS queued_by_recipient ON turns(recipient)
        WHERE status='queued'""",
+    # Entries are (conversation_id, rowid), so history pages read in turn order.
+    "CREATE INDEX IF NOT EXISTS turns_by_conversation ON turns(conversation_id)",
 )
+
+QUEUE_EXPIRED = "Deadline elapsed before the recipient claimed the request."
+LEASE_EXPIRED = "Execution lease elapsed before an answer. Execution outcome is unknown."
 
 TURN = """
 SELECT t.id, t.conversation_id, t.request, t.submitted_context, t.timeout, t.created_at,
        t.deadline, t.status, t.response_id, t.response, t.responded_at, t.detail,
        COALESCE(t.sender, c.sender) AS sender,
        COALESCE(t.recipient, c.recipient) AS recipient,
-       t.claimed_at, t.claim_token,
+       t.claimed_at, t.claim_token, t.rowid AS seq,
        c.context, c.created_at AS conversation_created_at,
        EXISTS(SELECT 1 FROM turns earlier
               WHERE earlier.conversation_id=t.conversation_id AND earlier.rowid<t.rowid)
@@ -441,14 +452,64 @@ class Store:
     def expire(self) -> bool:
         with self.transaction() as db:
             result = db.execute(
-                """UPDATE turns SET detail=CASE status
-                       WHEN 'running' THEN 'Deadline elapsed. Execution outcome is unknown.'
-                       ELSE 'Deadline elapsed before a daemon accepted the request.' END,
+                """UPDATE turns SET detail=CASE status WHEN 'running' THEN ? ELSE ? END,
                        status='timed_out'
                    WHERE status IN ('queued', 'running') AND deadline <= ?""",
-                (time.time(),),
+                (LEASE_EXPIRED, QUEUE_EXPIRED, time.time()),
             )
             return bool(result.rowcount)
+
+    @staticmethod
+    def accepts_long_messages(db, agent: str) -> bool:
+        row = db.execute(
+            "SELECT features FROM chat_capabilities WHERE agent=?", (agent,)
+        ).fetchone()
+        return bool(row) and "long_messages" in json.loads(row["features"])
+
+    def check_length(self, db, recipient: str, content: str):
+        if len(content) > LEGACY_TEXT and not self.accepts_long_messages(db, recipient):
+            raise PigeonError(
+                "message_limit",
+                f"{recipient} accepts at most {LEGACY_TEXT:,} characters per message, and this "
+                f"one has {len(content):,}. Split it, or ask the peer to update Pigeon.",
+                {"characters": len(content), "limit": LEGACY_TEXT},
+            )
+
+    @staticmethod
+    def active_turn_error(db, agent: str, conversation_id: str) -> PigeonError:
+        row = db.execute(
+            """SELECT t.id, t.status, t.deadline, COALESCE(t.sender, c.sender) AS sender
+               FROM turns t JOIN conversations c ON c.id=t.conversation_id
+               WHERE t.conversation_id=? AND t.status IN ('queued', 'running')
+               ORDER BY t.rowid DESC LIMIT 1""",
+            (conversation_id,),
+        ).fetchone()
+        if not row:
+            return PigeonError("conflict", "Another message was sent at the same time. Retry.")
+        outgoing = row["sender"] == agent
+        data = {
+            "direction": "outgoing" if outgoing else "incoming",
+            "conversation_id": conversation_id,
+            "message_id": row["id"],
+            "status": row["status"],
+            "deadline": row["deadline"],
+        }
+        if outgoing:
+            message = (
+                f"This chat's request {row['id']} is still {row['status']}. Wait for its "
+                "answer by checking that request, or cancel it before sending another."
+            )
+        elif row["status"] == "queued":
+            message = (
+                f"The peer's request {row['id']} is queued for this chat. Receive and answer "
+                "it before sending a new message."
+            )
+        else:
+            message = (
+                f"This chat already claimed the peer's request {row['id']}. Answer it with "
+                "that request ID before sending a new message."
+            )
+        return PigeonError("turn_active", message, data)
 
     def submit(self, sender: str, request: Submit) -> dict:
         conversation_id = str(request.conversation_id)
@@ -516,15 +577,12 @@ class Store:
                     )
                 elif context is not None and context != conversation["context"]:
                     raise PigeonError("conflict", "Conversation context is fixed.")
-                previous = db.execute(
-                    """SELECT status FROM turns WHERE conversation_id=?
-                       ORDER BY rowid DESC LIMIT 1""",
+                if db.execute(
+                    """SELECT 1 FROM turns WHERE conversation_id=?
+                       AND status IN ('queued', 'running')""",
                     (conversation_id,),
-                ).fetchone()
-                if previous and previous["status"] in ("queued", "running"):
-                    raise PigeonError(
-                        "conflict", "Follow-ups require a completed turn. Check its status."
-                    )
+                ).fetchone():
+                    raise self.active_turn_error(db, sender, conversation_id)
             elif not db.execute(
                 """SELECT 1 FROM grants g JOIN agents a ON a.address=g.recipient
                    WHERE g.sender=? AND g.recipient=? AND a.token_hash IS NOT NULL
@@ -544,6 +602,7 @@ class Store:
                        VALUES (?, ?, ?, ?, ?)""",
                     (conversation_id, sender, request.to, now, context),
                 )
+            self.check_length(db, request.to, request.message)
             pending = db.execute(
                 """SELECT 1 FROM turns t JOIN conversations c ON c.id=t.conversation_id
                    WHERE t.status IN ('queued', 'running')
@@ -571,9 +630,7 @@ class Store:
                     ),
                 )
             except sqlite3.IntegrityError:
-                raise PigeonError(
-                    "conflict", "Follow-ups require a completed turn. Check its status."
-                ) from None
+                raise self.active_turn_error(db, sender, conversation_id) from None
             return render_turn(db.execute(TURN + " WHERE t.id=?", (message_id,)).fetchone())
 
     def inspect(self, agent: str, request: Inspect | Cancel) -> dict:
@@ -786,33 +843,81 @@ class Store:
             if not row:
                 return None
             token = secrets.token_hex(8)
+            # The queue deadline stops applying once the recipient claims the turn.
             updated = db.execute(
-                """UPDATE turns SET status='running', claimed_at=?, claim_token=?
+                """UPDATE turns SET status='running', claimed_at=?, claim_token=?, deadline=?
                    WHERE id=? AND status='queued'""",
-                (now, token, row["id"]),
+                (now, token, now + LEASE, row["id"]),
             )
             if not updated.rowcount:
                 return None
             return render_turn(db.execute(TURN + " WHERE t.id=?", (row["id"],)).fetchone())
+
+    @staticmethod
+    def claimed_turn(db, recipient: str, message_id: str):
+        query = TURN + " WHERE t.id=? AND COALESCE(t.recipient, c.recipient)=?"
+        row = db.execute(query, (message_id, recipient)).fetchone()
+        if not row:
+            raise PigeonError("not_found", "Request not found.")
+        if row["status"] == "queued":
+            raise PigeonError("conflict", "Request must be claimed before completion.")
+        if row["status"] == "running" and row["deadline"] <= time.time():
+            db.execute(
+                "UPDATE turns SET status='timed_out', detail=? WHERE id=?",
+                (LEASE_EXPIRED, message_id),
+            )
+            row = db.execute(query, (message_id, recipient)).fetchone()
+        return row
+
+    def renew(self, recipient: str, request: Renew) -> dict:
+        message_id = str(request.message_id)
+        now = time.time()
+        with self.transaction() as db:
+            row = self.claimed_turn(db, recipient, message_id)
+            if row["status"] == "running":
+                # Renewal never revives a terminal turn and never runs past MAX_RUN.
+                started = row["claimed_at"] or row["created_at"]
+                deadline = min(now + LEASE, started + MAX_RUN)
+                if deadline > row["deadline"]:
+                    db.execute("UPDATE turns SET deadline=? WHERE id=?", (deadline, message_id))
+                    row = db.execute(TURN + " WHERE t.id=?", (message_id,)).fetchone()
+            return render_turn(row)
+
+    def history(self, agent: str, request: History) -> dict:
+        conversation_id = str(request.conversation_id)
+        with self.transaction(write=False) as db:
+            conversation = db.execute(
+                "SELECT sender, recipient FROM conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            if not conversation or agent not in (conversation["sender"], conversation["recipient"]):
+                raise PigeonError("not_found", "Conversation not found.")
+            rows = db.execute(
+                TURN + " WHERE t.conversation_id=? AND t.rowid<? ORDER BY t.rowid DESC LIMIT ?",
+                (conversation_id, request.before or 2**63 - 1, request.limit + 1),
+            ).fetchall()
+        turns = []
+        size = 64
+        for row in rows[: request.limit]:
+            turn = render_turn(row)
+            size += len(json.dumps(turn, ensure_ascii=False).encode()) + 1
+            # Each turn fits in a frame alone. Stop before a page would exceed one.
+            if turns and size > MAX_FRAME - 1024:
+                break
+            turns.append((row["seq"], turn))
+        more = len(turns) < len(rows)
+        return {
+            "turns": [turn for _, turn in turns],
+            "before": turns[-1][0] if more else None,
+        }
 
     def finish(self, recipient: str, result: Finish) -> dict:
         message_id = str(result.message_id)
         with self.transaction() as db:
             query = TURN + " WHERE t.id=? AND COALESCE(t.recipient, c.recipient)=?"
             params = (message_id, recipient)
-            row = db.execute(query, params).fetchone()
-            if not row:
-                raise PigeonError("not_found", "Request not found.")
-            if row["status"] == "queued":
-                raise PigeonError("conflict", "Request must be claimed before completion.")
-            if row["status"] == "running" and row["deadline"] <= time.time():
-                db.execute(
-                    """UPDATE turns SET status='timed_out',
-                       detail='Deadline elapsed. Execution outcome is unknown.' WHERE id=?""",
-                    (message_id,),
-                )
-                row = db.execute(query, params).fetchone()
+            row = self.claimed_turn(db, recipient, message_id)
             if row["status"] == "running":
+                self.check_length(db, row["sender"], result.content)
                 db.execute(
                     """UPDATE turns SET status=?, response_id=?, response=?, responded_at=?
                        WHERE id=?""",

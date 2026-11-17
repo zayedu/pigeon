@@ -26,11 +26,13 @@ from .models import (
     Command,
     Finish,
     Grant,
+    History,
     Inspect,
     ListCalls,
     PigeonError,
     Ping,
     Redeem,
+    Renew,
     Share,
     Signup,
     Submit,
@@ -220,6 +222,10 @@ def create_app(path: Path | None) -> FastAPI:
                 result = await storage(store.close, agent, str(frame.conversation_id))
             case Finish():
                 result = await storage(store.finish, agent, frame)
+            case Renew():
+                result = await storage(store.renew, agent, frame)
+            case History():
+                return await storage(store.history, agent, frame)
             case Grant():
                 result = await storage(store.grant, agent, frame.sender, frame.op == "allow")
             case ListCalls():
@@ -237,7 +243,7 @@ def create_app(path: Path | None) -> FastAPI:
                 return await storage(store.redeem, agent, frame.key, frame.peer_session)
             case Ping():
                 return {"agent": agent, "protocol": 1, "features": RELAY_FEATURES}
-        if isinstance(frame, (Submit, Cancel, Finish)):
+        if isinstance(frame, (Submit, Cancel, Finish, Renew)):
             notify_turn(result)
         else:
             notify()
@@ -285,6 +291,8 @@ def create_app(path: Path | None) -> FastAPI:
                     response = {"error": "invalid_frame", "message": "Invalid protocol frame."}
                 except PigeonError as exc:
                     response = {"error": exc.code, "message": str(exc)}
+                    if exc.data is not None:
+                        response["data"] = exc.data
                 except sqlite3.OperationalError:
                     response = {"error": "storage_unavailable", "message": "Relay storage is busy."}
                 await socket.send_json(response)

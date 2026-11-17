@@ -11,7 +11,7 @@ from pathlib import Path
 from select import select
 from uuid import UUID, uuid4
 
-from .models import MAX_TEXT, PigeonError, Turn
+from .models import LEGACY_TEXT, PigeonError, Turn
 
 
 @asynccontextmanager
@@ -258,7 +258,7 @@ class Codex:
                             "type": "item.completed",
                             "item": {"type": "agent_message", "text": str(value)},
                         }:
-                            answer = value[:MAX_TEXT]
+                            answer = value[:LEGACY_TEXT]
                 else:
                     await process.wait()
                 if (
@@ -376,7 +376,7 @@ class Claude:
                             "session_id": str(result_session),
                             "result": str(text),
                         } if result_session == session_id:
-                            answer = text[:MAX_TEXT]
+                            answer = text[:LEGACY_TEXT]
                 await process.wait()
                 if process.returncode == 0 and initialized and answer.strip():
                     return session_id, answer
